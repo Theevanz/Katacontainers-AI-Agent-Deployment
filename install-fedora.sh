@@ -226,6 +226,7 @@ write_daemon_json() {
   if [[ -z "$kata_config_path" ]]; then
     for candidate in \
         /usr/share/kata-containers/configuration.toml \
+        /usr/share/kata-containers/defaults/configuration.toml \
         /usr/share/defaults/kata-containers/qemu/configuration.toml \
         /usr/share/defaults/kata-containers/configuration.toml \
         /etc/kata-containers/configuration.toml \
