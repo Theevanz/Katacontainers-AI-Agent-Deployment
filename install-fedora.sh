@@ -142,8 +142,12 @@ install_packages() {
   # runtime-rs is default upstream from Kata 4.0.0, but the Fedora package
   # ships the Go runtime.
   dnf -y install kata-containers docker policycoreutils policycoreutils-python-utils \
+    dbus dbus-daemon \
     || die "Package installation failed. Check that this Fedora release still
-     carries kata-containers, docker, and the related policycoreutils."
+     carries kata-containers, docker, and the related policycoreutils.
+     If the failure is on `kata-containers`'s post-install script, the missing
+     tool is almost certainly dracut's dbus module, which is what the new
+     dbus/dbus-daemon prerequisite on the same line provides."
 
   # Compose v2 is the ONLY hard input to the session lifecycle, so its
   # package name is resolved rather than assumed: F38's own repos ship it as
