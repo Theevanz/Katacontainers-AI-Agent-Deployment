@@ -71,8 +71,11 @@ need_docker() {
 
 # Seed /etc/secureai/compose.env from the shipped template on FIRST run only.
 # Re-running preserves existing values, so an operator's edit is never lost.
+# Note: the installer creates the file EMPTY (AD-11: it may create but never
+# populate, and the CLI is its sole writer) -- so "file exists" alone must not
+# suppress the seed; the seed must also land when the file is EMPTY.
 ensure_compose_env() {
-  if [[ ! -f "$SECUREAI_COMPOSE_ENV" ]]; then
+  if [[ ! -s "$SECUREAI_COMPOSE_ENV" ]]; then
     local template="${SECUREAI_APP_DIR}/config/compose.env"
     if [[ -f "$template" ]]; then
       install -m 0640 "$template" "$SECUREAI_COMPOSE_ENV"
