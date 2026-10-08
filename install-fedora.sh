@@ -431,9 +431,9 @@ install_layout() {
   # re-grouped for the proxy, and it stays deny-all to everyone else (AD-7).
   chown -R root:root "$SECUREAI_ETC"
   chmod 0700 "$SECUREAI_ETC"
-  install -d -m 0750 -o root -g 10001 "$SECUREAI_VAR"
-  install -d -m 2770 -o root -g 10001 "${SECUREAI_VAR}/ca"
-  chown -R root:10001 "$SECUREAI_VAR"
+  install -d -m 0750 -o root -g 1000 "$SECUREAI_VAR"
+  install -d -m 2770 -o root -g 1000 "${SECUREAI_VAR}/ca"
+  chown -R root:1000 "$SECUREAI_VAR"
   chmod 0750 "$SECUREAI_VAR"
   chmod 2770 "${SECUREAI_VAR}/ca"
 

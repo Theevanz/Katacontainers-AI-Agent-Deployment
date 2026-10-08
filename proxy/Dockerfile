@@ -17,29 +17,21 @@ FROM mitmproxy/mitmproxy:12.2.3
 # with a permission error that looks like a broken proxy (Story 2.3).
 COPY --chmod=0644 proxy/addon.py /opt/secureai/addon.py
 
-# Pin the unprivileged user's GID to SECUREAI_PROXY_GID (10001).
-#
-# This exists so the host can grant the proxy read access to its config WITHOUT
-# making that config world-readable. Bind mounts preserve the host's uid, gid
-# and mode, so a 0700 root-owned /var/lib/secureai would be unreadable by the
-# process that must read the allowlist and the keys -- which, because the addon
-# fails closed on unreadable config (AD-13), would mean every request 403s.
-# Instead: the dir is root:10001 0750 and the files root:10001 0640, so the
-# proxy reads exactly what it needs and the host's other users read nothing.
-ARG SECUREAI_PROXY_GID=10001
-RUN set -eux; \
-    groupmod -g "${SECUREAI_PROXY_GID}" mitmproxy; \
-    usermod -g "${SECUREAI_PROXY_GID}" mitmproxy; \
-    install -d -m 0750 -o root -g "${SECUREAI_PROXY_GID}" /config/ca
+# NOTE: this Dockerfile deliberately does NOT re-map the `mitmproxy` user.
+# The upstream `docker-entrypoint.sh` is responsible for re-pinning that user's
+# uid/gid to the owner of /home/mitmproxy/.mitmproxy at container start, so any
+# host-side gid we assert would race with that step and make the next startup
+# fail with "usermod: group '<base-gid>' does not exist". Instead the host
+# state is shaped to MATCH the base image's canonical uid/gid (1000), so the
+# entrypoint's re-pin is a no-op and gosu can drop cleanly into mitmproxy.
 
-USER mitmproxy
-
-# Bind-mounted at /config, owned root:10001 0750 on the host and mounted
+# Bind-mounted at /config, owned root:1000 0750 on the host and mounted
 # :z:ro, with /config/ca mounted separately read-write. Read-only because the
 # proxy NEVER writes config (AD-13): /etc/secureai is the sole source of truth
-# and the CLI is its only writer. The CA subdirectory is the single exception --
-# mitmproxy must persist a generated keypair across restarts, or it would mint
-# a new CA every start and the guest's baked-in trust would stop validating.
+# and the CLI is its only writer. The CA subdirectory is the single exception
+# -- mitmproxy must persist a generated keypair across restarts, or it would
+# mint a new CA every start and the guest's baked-in trust would stop
+# validating.
 ENV SECUREAI_CONFIG_DIR=/config
 
 EXPOSE 8080

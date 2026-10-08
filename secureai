@@ -43,7 +43,7 @@ readonly SECUREAI_OPENCODE_CONTAINER="secureai-opencode"
 # config/compose.env (the single source); this default only lets the config
 # bootstrapping below run before compose.env is first sourced. Sourcing
 # compose.env afterwards overrides it with the authoritative value.
-: "${SECUREAI_PROXY_GID:=10001}"
+: "${SECUREAI_PROXY_GID:=1000}"
 export SECUREAI_PROXY_GID
 
 # --- output helpers ------------------------------------------------------
@@ -383,7 +383,7 @@ cmd_ca_export() {
   load_compose_env
 
   log "Exporting the interception CA (confdir=${SECUREAI_VAR}/ca)"
-  # 2770: group-write so the proxy container's unprivileged user (gid 10001)
+  # 2770: group-write so the proxy container's unprivileged user (gid 1000)
   # can create the CA keypair here -- this SAME directory is the proxy's
   # confdir, so the exported CA and the proxy's live CA are one and the same.
   install -d -m 2770 -o root -g "$SECUREAI_PROXY_GID" "${SECUREAI_VAR}/ca"
@@ -412,7 +412,7 @@ cmd_ca_export() {
        pid=\$!; sleep 3; kill -TERM \$pid 2>/dev/null; wait \$pid 2>/dev/null; true" \
       >/dev/null 2>&1 || true
     # The container ran as root for writability; re-pin the artifacts so the
-    # non-root proxy container (host gid 10001) reads them, and the private key
+    # non-root proxy container (host gid 1000) reads them, and the private key
     # is not writable/readable by the world.
     chown root:"${SECUREAI_PROXY_GID}" "${SECUREAI_VAR}/ca"/* 2>/dev/null || true
     chmod 0640 "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert-key.pem 2>/dev/null || true
