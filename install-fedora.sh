@@ -138,13 +138,32 @@ check_preconditions() {
 # PHASE 2 -- packages
 # =========================================================================
 install_packages() {
-  log "Installing Kata Containers, Docker Engine, and Docker Compose v2"
+  log "Installing Kata Containers and Docker Engine"
   # runtime-rs is default upstream from Kata 4.0.0, but the Fedora package
-  # ships the Go runtime; the stack table pins F43=3.25.0 / F44=3.26.0.
-  dnf -y install kata-containers docker docker-compose-plugin policycoreutils \
-    policycoreutils-python-utils || \
-    die "Package installation failed. Check that this Fedora release still
-     carries kata-containers, docker, and docker-compose-plugin."
+  # ships the Go runtime.
+  dnf -y install kata-containers docker policycoreutils policycoreutils-python-utils \
+    || die "Package installation failed. Check that this Fedora release still
+     carries kata-containers, docker, and the related policycoreutils."
+
+  # Compose v2 is the ONLY hard input to the session lifecycle, so its
+  # package name is resolved rather than assumed: F38's own repos ship it as
+  # docker-compose-plugin (also the docker-ce-stable package), and some F43/F44
+  # images ship it only from the Docker CE repo under the same name. If neither
+  # works, the message points at the right-hand place to get it, instead of
+  # 'No match for argument' from dnf.
+  if dnf -y install docker-compose-plugin 2>/dev/null || dnf -y install docker-compose 2>/dev/null; then
+    : # installed
+  else
+    warn "No docker-compose plugin package resolved from Fedora's own repos."
+    warn "Enable the Docker CE stable repo, then re-run the installer:"
+    warn "  dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo"
+    warn "  dnf install docker-compose-plugin"
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    die "'docker compose' is not available after package resolution.
+     Enable the Docker CE stable repo (see above) and re-run install-fedora.sh,
+     or install the compose cli-plugin by hand."
+  fi
   ok "packages installed"
 
   # Docker must be RUNNING, not merely installed. Without this, a fresh install
