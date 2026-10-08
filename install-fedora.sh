@@ -22,7 +22,17 @@
 
 set -euo pipefail
 
-readonly SECUREAI_FEDORA_VERSIONS="43 44"
+# Versions the installer will run on. Default is everything this build has been
+# reasoned through for; tighten or widen via this environment variable
+# (SECUREAI_FEDORA_VERSIONS="38" install-fedora.sh ships F38 support without
+# committing to F43/F44 assumption-only acceptance). This is the one knob a
+# tester uses to prove the guard works without editing source text:
+#
+#   SECUREAI_FEDORA_VERSIONS="99" bash install-fedora.sh
+#
+# A wider list that INCLUDES the host's version makes the installer proceed;
+# anything narrower refuses with a readable message.
+readonly SECUREAI_FEDORA_VERSIONS="${SECUREAI_FEDORA_VERSIONS:-38 43 44}"
 readonly SECUREAI_APP_DIR="/opt/secureai"
 readonly SECUREAI_BIN="/usr/local/bin/secureai"
 readonly SECUREAI_ETC="/etc/secureai"
@@ -63,23 +73,25 @@ die()  { printf '\033[1;31m error\033[0m %s\n' "$*" >&2; exit 1; }
 check_preconditions() {
   log "Checking that this host can run SecureAI"
 
-  # 1. Fedora 43/44 only -- 41 and 42 are EOL.
+  # 1. Fedora 38/43/44 only -- 41 and 42 are EOL. If the host is not a
+  #    supported Fedora at all, say so and stop before touching anything.
   if [[ ! -r /etc/os-release ]]; then
-    die "SecureAI needs Fedora 43 or 44, but /etc/os-release could not be read,
-     so the distribution could not be identified. Unsupported platform."
+    die "SecureAI needs one of: ${SECUREAI_FEDORA_VERSIONS}, but /etc/os-release could not be read,
+     so the distribution could not be identified. Unsupported platform. Set
+     SECUREAI_FEDORA_VERSIONS=<supported list> to acknowledge other Fedoras."
   fi
   # shellcheck disable=SC1091
   . /etc/os-release
   local detected="${NAME:-unknown} ${VERSION_ID:-unknown}"
   if [[ "${ID:-}" != "fedora" ]]; then
-    die "SecureAI supports Fedora 43 or 44 only.
-     Detected: ${detected}
+    die "SecureAI supports Fedora ${SECUREAI_FEDORA_VERSIONS}, detected ${detected}.
      This is a proof of concept and has not been ported to your platform."
   fi
   if [[ " ${SECUREAI_FEDORA_VERSIONS} " != *" ${VERSION_ID:-} "* ]]; then
-    die "SecureAI supports Fedora 43 or 44 only.
-     Detected: ${detected}
-     Fedora 41 and 42 are end-of-life and receive no Kata Containers package."
+    die "SecureAI supports Fedora ${SECUREAI_FEDORA_VERSIONS}, detected ${detected}.
+     Set SECUREAI_FEDORA_VERSIONS='${VERSION_ID:-}' to acknowledge this host, at
+     your own risk -- Kata/Docker package versions on ${VERSION_ID:-unknown} are
+     not covered by the version matrix in AD-6."
   fi
   ok "Fedora ${VERSION_ID}"
 
@@ -180,6 +192,29 @@ write_daemon_json() {
 
   local raw_version version_key time_ns_flag
   raw_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "")"
+  local kata_config_path=""
+  for candidate in \
+      /usr/share/kata-containers/configuration.toml \
+      /usr/share/defaults/kata-containers/vm.json \
+      /usr/share/kata-containers/configuration-qemu-pkg-forced.toml \
+      /usr/share/kata-containers/runtime-rs.json \
+      /opt/kata/configuration.toml \
+      /opt/kata/share/defaults/kata-containers/qemu/configuration.toml; do
+    if [[ -f "$candidate" ]]; then
+      kata_config_path="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$kata_config_path" ]]; then
+    die "Kata's runtime config was not found in any known location.
+     After kata-containers is installed, locate it with:
+       rpm -ql kata-containers | grep configuration
+     and re-run the installer, exporting SECUREAI_KATA_CONFIG_PATH explicitly:"
+  fi
+  # F43/F44 go-runtime packages put it at /usr/share/kata-containers/...; F38
+  # (Kata 3.0.1) ships it under /usr/share/defaults/. The check above searches
+  # both -- widen the candidate list before ever hard-coding.
+  SECUREAI_KATA_CONFIG_PATH="${SECUREAI_KATA_CONFIG_PATH:-${kata_config_path}}"
   if version_key="$(docker_version_key "$raw_version")"; then
     if (( version_key >= SECUREAI_TIME_NS_MIN_KEY )); then
       time_ns_flag="true"
@@ -206,7 +241,10 @@ write_daemon_json() {
   else
     printf '{}\n' >"$tmp"
   fi
-  python3 - "$tmp" "$time_ns_flag" <<'PY'
+  python3 - "$tmp" "$time_ns_flag" <<PY
+# (unquoted heredoc on purpose: bash expands $SECUREAI_KATA_CONFIG_PATH
+# inside the python before python parses it; the block itself contains no
+# other `$`, and the ConfigPath value is validated by the loop above.)
 import json, sys
 
 path, time_ns_flag = sys.argv[1], sys.argv[2]
@@ -223,7 +261,7 @@ if not isinstance(cfg, dict):
 cfg["runtimes"] = {
     "kata": {
         "runtimeType": "containerd-shim-kata-v2",
-        "options": {"ConfigPath": "/usr/share/kata-containers/configuration.toml"},
+        "options": {"ConfigPath": "$SECUREAI_KATA_CONFIG_PATH"},
     }
 }
 

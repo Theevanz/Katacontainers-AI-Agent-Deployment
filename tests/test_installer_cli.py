@@ -61,40 +61,25 @@ class TestInstallerPreconditions(unittest.TestCase):
     """Matrix rows 1 and 2 -- exercised for real, not just asserted."""
 
     def test_unsupported_distribution_exits_nonzero_naming_versions(self):
-        # On a SUPPORTED host (Fedora 43/44, root) the installer would mutate
-        # the machine, so the only safe way to run it for real is on an
-        # unsupported host -- which is precisely the case under test. Detect
-        # that case and skip rather than gamble on whatever host runs the suite.
-        supported_host_attack = False
-        try:
-            info = {}
-            with open('/etc/os-release', encoding='utf-8', errors='replace') as fh:
-                for line in fh:
-                    if '=' in line:
-                        k, v = line.split('=', 1)
-                        info[k.strip()] = v.strip().strip('"')
-            supported_host_attack = (
-                info.get('ID') == 'fedora'
-                and info.get('VERSION_ID') in ('43', '44')
-                and os.geteuid() == 0
-            )
-        except (OSError, ValueError):
-            pass
-        if supported_host_attack:
-            self.skipTest(
-                'host is a supported root Fedora -- running the installer would '
-                'mutate it; the precondition gate cannot be exercised safely here'
-            )
+        # Force an unsupported list so the Fedora gate fires deterministically
+        # regardless of the host this test happens to run on -- and so running
+        # it on a supported+root machine is still a property of the GATE
+        # running (it dies before `install_packages` of `dnf`), never an
+        # exercise of the mutating path. No skip required here.
+        env = os.environ.copy()
+        env["SECUREAI_FEDORA_VERSIONS"] = "99 77"
         result = subprocess.run(
-            ["bash", INSTALLER], capture_output=True, text=True, timeout=60,
+            ["bash", INSTALLER], capture_output=True, text=True, timeout=60, env=env,
         )
         self.assertNotEqual(result.returncode, 0, "an unsupported host must exit non-zero")
         output = result.stdout + result.stderr
         # Readable by a developer who does not know Kata or Docker (Story 1.2):
-        # it must name what was detected AND what is supported.
+        # it must name the DETECTED distribution, the CONFIGURED supported
+        # versions, and the exact way to acknowledge this host.
         self.assertIn("Fedora", output)
-        self.assertRegex(output, r"\b43\b")
-        self.assertRegex(output, r"\b44\b")
+        self.assertIn("99", output)
+        self.assertIn("77", output)
+        self.assertIn("SECUREAI_FEDORA_VERSIONS", output)
 
     def test_preconditions_run_before_any_package_install_or_write(self):
         """Story 1.2: every precondition completes before the first write."""

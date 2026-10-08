@@ -40,7 +40,7 @@ the blocking open question in the architecture spine; until it is answered, trea
 
 ## Requirements
 
-- Fedora 43 or 44 (asserted by the installer, which refuses anything else)
+- Fedora 38, 43, or 44 (asserted by the installer, which refuses anything else)
 - `sudo` access
 - A host with nested virtualization enabled
 
@@ -182,7 +182,7 @@ Not addressed in this proof of concept:
   acknowledged tension with this and is untested)
 - no network-level egress backstop
 - HTTP/2 support unverified
-- Fedora 43/44 only
+- Fedora 38/43/44 only
 
 Certificate pinning is *not* on this list: it was checked and opencode performs no TLS
 pinning, which is what makes MITM substitution viable here.
