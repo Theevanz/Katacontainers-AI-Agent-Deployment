@@ -465,5 +465,86 @@ class TestCaBuildOrder(unittest.TestCase):
         self.assertIn("mitmproxy-ca-cert.pem", body)
 
 
+class TestProxyDeathVisibility(unittest.TestCase):
+    """The proxy ran with `--rm`, so a startup exit auto-removes the container.
+
+    Structural coverage of the two failure modes that made a dead proxy
+    undebuggable: the CA key permissions mitmdump needs to stay alive, and
+    log capture that survives the container's auto-removal.
+    """
+
+    def test_ca_export_chmods_the_key_mitmproxy_actually_writes(self):
+        body = function_body(CLI, "cmd_ca_export")
+        self.assertIn('chmod 0640 "${SECUREAI_VAR}/ca/mitmproxy-ca.pem"', body,
+                      "the combined private key must be group-readable")
+        # mitmproxy 12.x never writes this name; chmodding it is a no-op that
+        # left the real key at 0600 and killed the proxy at startup.
+        code = "\n".join(
+            line for line in body.splitlines()
+            if line.strip() and not line.strip().startswith("#"))
+        self.assertNotIn("mitmproxy-ca-cert-key.pem", code)
+
+    def test_ca_export_repins_permissions_after_the_generate_reuse_branch(self):
+        body = function_body(CLI, "cmd_ca_export")
+        reuse_start = body.index('if [[ -f "$existing" ]]')
+        branch_end = body.index("\n  fi\n", reuse_start)
+        after_branch = body[branch_end:]
+        self.assertIn("mitmproxy-ca.pem", after_branch,
+                      "the re-pin must run after the generate/reuse branch so "
+                      "an install pinned by an older CLI is repaired on reuse")
+
+    def test_ca_export_p12_chmod_is_guarded(self):
+        # The combined .pem is existence-checked, the .p12 is not; under
+        # `set -e` an unguarded chmod of a missing .p12 would abort the
+        # export with a raw error after the CA was already exported.
+        body = function_body(CLI, "cmd_ca_export")
+        self.assertIn('chmod 0640 "${SECUREAI_VAR}/ca/mitmproxy-ca.p12" 2>/dev/null || true',
+                      body)
+
+    def test_ca_export_dies_if_the_private_key_is_missing(self):
+        body = function_body(CLI, "cmd_ca_export")
+        self.assertIn("mitmproxy-ca.pem is missing", body)
+
+    def test_opencode_streams_proxy_logs_from_creation(self):
+        body = function_body(CLI, "cmd_opencode")
+        # Backgrounded and appending: a foreground `docker logs -f` would hang
+        # the session, and a truncating single-writer snapshot cannot survive
+        # the container's auto-removal.
+        self.assertIn('docker logs -f "$SECUREAI_PROXY_CONTAINER" '
+                      '>>"${SECUREAI_VAR}/proxy.log" 2>/dev/null &', body)
+        self.assertIn("LOG_STREAM_PID=$!", body)
+
+    def test_opencode_treats_a_vanished_container_as_death(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("vanished", body,
+                      "with --rm, `docker inspect` failing is the only "
+                      "observable form of an early proxy exit")
+
+    def test_failure_path_prints_the_captured_log_not_docker_logs(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn('tail -20 "${SECUREAI_VAR}/proxy.log"', body)
+        self.assertNotIn('docker logs "$SECUREAI_PROXY_CONTAINER" 2>&1 | tail', body,
+                         "by the time the failure path runs, --rm may have "
+                         "already removed the container")
+
+    def test_cli_is_syntactically_valid_bash(self):
+        # Executable, not structural: the restructured session functions must
+        # at least parse.
+        result = subprocess.run(["bash", "-n", CLI], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_teardown_does_not_clobber_the_streamed_log(self):
+        body = function_body(CLI, "teardown_session")
+        snapshot_idx = body.index('>"${SECUREAI_VAR}/proxy.log"')
+        before_snapshot = body[:snapshot_idx]
+        self.assertIn("docker inspect", before_snapshot,
+                      "the snapshot must be guarded by a container-existence "
+                      "check so it cannot overwrite the streamed log with "
+                      "the daemon's 'No such container' error")
+        self.assertIn('kill "$LOG_STREAM_PID"', before_snapshot,
+                      "the stream must be stopped before the snapshot, or its "
+                      "appends race the truncated file")
+
+
 if __name__ == "__main__":
     unittest.main()

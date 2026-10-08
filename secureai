@@ -411,17 +411,30 @@ cmd_ca_export() {
       "mitmdump --set confdir=/config/ca --set termlog_verbosity=error -q & \
        pid=\$!; sleep 3; kill -TERM \$pid 2>/dev/null; wait \$pid 2>/dev/null; true" \
       >/dev/null 2>&1 || true
-    # The container ran as root for writability; re-pin the artifacts so the
-    # non-root proxy container (host gid 1000) reads them, and the private key
-    # is not writable/readable by the world.
-    chown root:"${SECUREAI_PROXY_GID}" "${SECUREAI_VAR}/ca"/* 2>/dev/null || true
-    chmod 0640 "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert-key.pem 2>/dev/null || true
-    chmod 0644 "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert.pem 2>/dev/null || true
     [[ -f "$existing" ]] || die "CA generation produced no ${existing}.
  Check that the proxy image ${SECUREAI_PROXY_IMAGE} could be pulled."
     install -m 0644 "$existing" "$SECUREAI_CA"
     ok "generated a new CA"
   fi
+
+  # Re-pin ownership and permissions on BOTH the generate and the reuse path:
+  # the generation container ran as root for writability, and a reused CA may
+  # come from an install whose export chmodded a filename mitmproxy 12.x never
+  # writes (mitmproxy-ca-cert-key.pem), leaving the real key unreadable. The
+  # proxy's unprivileged user (gid 1000) must be able to READ the key material;
+  # the private halves stay 0640 so the world cannot.
+  chown root:"${SECUREAI_PROXY_GID}" "${SECUREAI_VAR}/ca"/* 2>/dev/null || true
+  chmod 0644 "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert.pem 2>/dev/null || true
+  [[ -f "${SECUREAI_VAR}/ca/mitmproxy-ca.pem" ]] || die \
+"${SECUREAI_VAR}/ca/mitmproxy-ca.pem is missing -- the CA is incomplete and
+  cannot serve interception. Re-running 'ca export' reuses the cert and lands
+  here again; remove the directory and generate a fresh CA instead (this
+  invalidates trust baked into guest images, which must then be rebuilt):
+    sudo rm -rf ${SECUREAI_VAR}/ca
+    sudo secureai ca export && sudo secureai build"
+  chmod 0640 "${SECUREAI_VAR}/ca/mitmproxy-ca.pem"
+  # The .p12 carries the same key but is optional across mitmproxy versions.
+  chmod 0640 "${SECUREAI_VAR}/ca/mitmproxy-ca.p12" 2>/dev/null || true
 
   # Only the PUBLIC certificate leaves. The private key stays in
   # ${SECUREAI_VAR}/ca and never enters the guest.
@@ -551,15 +564,30 @@ assert_runtime_registered() {
 # the pair down on INT/TERM so nothing is orphaned. No systemd unit
 # auto-starts the proxy -- that would contradict per-session containment (F12).
 SESSION_ACTIVE=0
+# PID of the `docker logs -f` stream cmd_opencode starts; 0 when none runs.
+LOG_STREAM_PID=0
 teardown_session() {
   printf '\n'
   log "Tearing down the session"
+  # Stop the log stream BEFORE the snapshot: it appends to proxy.log, so a
+  # snapshot taken while it still runs can interleave with or be appended
+  # after the truncated file.
+  if [[ "$LOG_STREAM_PID" -ne 0 ]]; then
+    kill "$LOG_STREAM_PID" 2>/dev/null || true
+    wait "$LOG_STREAM_PID" 2>/dev/null || true
+    LOG_STREAM_PID=0
+  fi
   # Preserve the proxy's log BEFORE removing the container: `secureai opencode`
   # tears both containers down when the session ends, and `secureai verify`
   # must still be able to report what that session's proxy saw and injected.
   # Without this the two commands worked together only if the agent were left
   # running -- and a clean session start proves nothing on its own.
-  docker logs "$SECUREAI_PROXY_CONTAINER" >"${SECUREAI_VAR}/proxy.log" 2>&1 || true
+  # Guarded by an existence check: a proxy that died under --rm is already
+  # gone, and the daemon's "No such container" error must not overwrite the
+  # streamed log cmd_opencode captured -- it is the only record of the death.
+  if docker inspect "$SECUREAI_PROXY_CONTAINER" >/dev/null 2>&1; then
+    docker logs "$SECUREAI_PROXY_CONTAINER" >"${SECUREAI_VAR}/proxy.log" 2>&1 || true
+  fi
   # Stop the guest first: it is the one holding an interactive TTY.
   docker rm -f "$SECUREAI_OPENCODE_CONTAINER" >/dev/null 2>&1 || true
   docker rm -f "$SECUREAI_PROXY_CONTAINER" >/dev/null 2>&1 || true
@@ -614,20 +642,36 @@ cmd_opencode() {
     || die "The proxy could not start.
  Read the cause above. The agent will not start against a proxy that failed."
 
+  # Stream the proxy's output from the moment it exists: `run --rm` removes
+  # the container the instant it exits, taking everything `docker logs` could
+  # have shown with it. The stream survives the container, so a proxy that
+  # dies during startup still leaves its cause in proxy.log.
+  : >"${SECUREAI_VAR}/proxy.log"
+  # The stream's own stderr is discarded: if the proxy dies before the follow
+  # attaches, the daemon's "No such container" error is not a proxy log and
+  # must not be presented as one.
+  docker logs -f "$SECUREAI_PROXY_CONTAINER" >>"${SECUREAI_VAR}/proxy.log" 2>/dev/null &
+  LOG_STREAM_PID=$!
+
   # Bounded wait: a proxy that never becomes healthy must surface a readable
   # error, not hang the session forever (Story 2.6). The container's own
   # health status is authoritative -- `compose ps` does not reliably list
   # one-shot `run` containers, so using it here would report "never healthy"
   # for a proxy that is in fact up.
   log "Waiting for the proxy to answer"
-  local waited=0 healthy=0
+  local waited=0 healthy=0 vanished=0
   while (( waited < 60 )); do
+    # With --rm, an exited proxy is auto-removed: a container that no longer
+    # inspects IS the exited state, and the only form of it we can observe.
+    if ! docker inspect "$SECUREAI_PROXY_CONTAINER" >/dev/null 2>&1; then
+      vanished=1
+      break
+    fi
     if [[ "$(docker inspect --format '{{.State.Health.Status}}' "$SECUREAI_PROXY_CONTAINER" 2>/dev/null)" == "healthy" ]]; then
       healthy=1
       break
     fi
-    # Bail early if the container already exited -- waiting out the full 60s
-    # for a dead proxy is a worse error than reading its logs.
+    # Belt and braces for a proxy that exits but somehow still inspects.
     if [[ "$(docker inspect --format '{{.State.Status}}' "$SECUREAI_PROXY_CONTAINER" 2>/dev/null)" == "exited" ]]; then
       break
     fi
@@ -636,11 +680,20 @@ cmd_opencode() {
   done
   if [[ "$healthy" -ne 1 ]]; then
     log "Proxy logs:"
-    docker logs "$SECUREAI_PROXY_CONTAINER" 2>&1 | tail -20 || true
+    if [[ -s "${SECUREAI_VAR}/proxy.log" ]]; then
+      tail -20 "${SECUREAI_VAR}/proxy.log"
+    else
+      printf '  (no output was captured before the proxy died)\n'
+    fi
     teardown_session
+    if [[ "$vanished" -eq 1 ]]; then
+      die "The proxy exited during startup and --rm removed its container, so
+ the agent was NOT started -- a session against a dead proxy cannot work.
+ The logs above name the cause; the full stream is at ${SECUREAI_VAR}/proxy.log."
+    fi
     die "The proxy did not become healthy within ${waited}s, so the agent was
  NOT started -- a session against a dead proxy cannot work.
- The logs above name the cause."
+ The logs above name the cause; the full stream is at ${SECUREAI_VAR}/proxy.log."
   fi
   ok "proxy healthy after ${waited}s"
   local healthy_since_s="$SECONDS"
