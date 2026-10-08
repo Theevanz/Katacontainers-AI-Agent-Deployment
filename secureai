@@ -17,7 +17,7 @@ readonly SECUREAI_ETC="/etc/secureai"
 readonly SECUREAI_VAR="/var/lib/secureai"
 readonly SECUREAI_COMPOSE_ENV="${SECUREAI_ETC}/compose.env"
 readonly SECUREAI_COMPOSE_FILE="${SECUREAI_APP_DIR}/docker-compose.yml"
-readonly SECUREAI_WORKSPACE="${SECUREAI_VAR}/workspace"
+SECUREAI_WORKSPACE="${SECUREAI_VAR}/workspace"  # NOT readonly: compose.env is allowed to re-pin it
 readonly SECUREAI_CA="${SECUREAI_VAR}/ca.pem"
 
 # The nine reviewed hosts of AD-15. Seeded on first run so a fresh install works
