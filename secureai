@@ -395,14 +395,28 @@ cmd_ca_export() {
     install -m 0644 "$existing" "$SECUREAI_CA"
     ok "reused the existing CA -- trust baked into guest images stays valid"
   else
-    # One-shot container; it generates the CA on first run and exits.
+    # One-shot container; it generates the CA on first startup and exits.
+    # Use the UPSTREAM mitmproxy tag, not ${SECUREAI_PROXY_IMAGE}: the project
+    # image only exists after `secureai build`, but the guest image CANNOT be
+    # built before this export runs (AD-12), so an export that required the
+    # built image would deadlock the bootstrap order. The CA-generation
+    # container needs only mitmdump, which the upstream image provides.
     docker run --rm \
       --name secureai-ca-export \
       --network none \
+      --user 0 \
       -v "${SECUREAI_VAR}/ca:/config/ca:Z" \
-      "${SECUREAI_PROXY_IMAGE}" \
-      mitmdump --set confdir=/config/ca --set termlog_verbosity=error \
-               --set flow_detail=0 -h >/dev/null 2>&1 || true
+      --entrypoint /bin/sh \
+      mitmproxy/mitmproxy:12.2.3 -c \
+      "mitmdump --set confdir=/config/ca --set termlog_verbosity=error -q & \
+       pid=\$!; sleep 3; kill -TERM \$pid 2>/dev/null; wait \$pid 2>/dev/null; true" \
+      >/dev/null 2>&1 || true
+    # The container ran as root for writability; re-pin the artifacts so the
+    # non-root proxy container (host gid 10001) reads them, and the private key
+    # is not writable/readable by the world.
+    chown root:"${SECUREAI_PROXY_GID}" "${SECUREAI_VAR}/ca"/* 2>/dev/null || true
+    chmod 0640 "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert-key.pem 2>/dev/null || true
+    chmod 0644 "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert.pem 2>/dev/null || true
     [[ -f "$existing" ]] || die "CA generation produced no ${existing}.
  Check that the proxy image ${SECUREAI_PROXY_IMAGE} could be pulled."
     install -m 0644 "$existing" "$SECUREAI_CA"
