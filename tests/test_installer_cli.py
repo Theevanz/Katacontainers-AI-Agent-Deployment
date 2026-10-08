@@ -533,6 +533,19 @@ class TestProxyDeathVisibility(unittest.TestCase):
         result = subprocess.run(["bash", "-n", CLI], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_proxy_image_installs_the_addons_dependencies(self):
+        # addon.py imports yaml; the upstream mitmproxy image does not ship
+        # PyYAML, so mitmdump dies at startup with ModuleNotFoundError unless
+        # the image adds it. Verified live: with correct CA permissions the
+        # proxy reaches script load and fails on exactly this import.
+        dockerfile = read(os.path.join(REPO_ROOT, "proxy", "Dockerfile"))
+        self.assertIn("pip install", dockerfile)
+        self.assertIn("pyyaml", dockerfile.lower())
+        addon = read(os.path.join(REPO_ROOT, "proxy", "addon.py"))
+        self.assertIn("import yaml", addon,
+                      "if the addon drops the yaml import, drop the image "
+                      "dependency and this test with it")
+
     def test_teardown_does_not_clobber_the_streamed_log(self):
         body = function_body(CLI, "teardown_session")
         snapshot_idx = body.index('>"${SECUREAI_VAR}/proxy.log"')

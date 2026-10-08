@@ -12,6 +12,14 @@
 
 FROM mitmproxy/mitmproxy:12.2.3
 
+# The addon reads whitelist/keys/settings YAML at runtime, but the upstream
+# image ships only mitmproxy's own dependencies -- PyYAML is not among them,
+# and without it mitmdump exits at startup on `import yaml`. Left unpinned:
+# the base is python:3.14-slim with no compiler, so the install depends on a
+# wheel existing for the interpreter; pinning to a version without one would
+# turn this layer into a source build that cannot succeed here.
+RUN pip install --no-cache-dir pyyaml
+
 # The entrypoint gosu-drops to the unprivileged `mitmproxy` user and forces
 # HOME=/home/mitmproxy. So the addon must be world-readable or the drop fails
 # with a permission error that looks like a broken proxy (Story 2.3).

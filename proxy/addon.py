@@ -33,7 +33,6 @@ import time
 
 import yaml
 
-import mitmproxy.addons
 import mitmproxy.http
 
 logger = logging.getLogger("secureai")
@@ -131,7 +130,10 @@ def parse_bool(value, default=False):
     raise ValueError("not a boolean: %r" % (value,))
 
 
-class SecureAIAddon(mitmproxy.addons.Addon):
+# NO base class: mitmproxy 12 addons are plain objects -- hooks are discovered
+# by name, and `mitmproxy.addons.Addon` does not exist (it was a fiction of the
+# old test stub; inheriting from it made mitmdump exit at startup).
+class SecureAIAddon:
     """The single enforcement point: allowlist, key injection, SSE streaming."""
 
     # Process-global config cache: (signature, loaded_at, ttl, policy, error).

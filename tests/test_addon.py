@@ -59,19 +59,15 @@ def _install_mitmproxy_stub():
     import types
 
     mitmproxy = types.ModuleType("mitmproxy")
-    addons = types.ModuleType("mitmproxy.addons")
-
-    class Addon:
-        def load(self, loader):
-            return None
-
-    addons.Addon = Addon
+    # Deliberately NO `mitmproxy.addons.Addon` base class: it does not exist in
+    # real mitmproxy 12 (addons are plain objects whose hooks are discovered by
+    # name), and providing one here once let the addon inherit from a fiction
+    # that only existed in this stub. If addon.py ever references a made-up
+    # mitmproxy API again, these tests must fail.
     http = types.ModuleType("mitmproxy.http")
     http.Response = StubResponse
-    mitmproxy.addons = addons
     mitmproxy.http = http
     sys.modules["mitmproxy"] = mitmproxy
-    sys.modules["mitmproxy.addons"] = addons
     sys.modules["mitmproxy.http"] = http
     return True
 
