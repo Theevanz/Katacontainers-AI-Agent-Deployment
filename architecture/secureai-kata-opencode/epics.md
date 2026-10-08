@@ -220,7 +220,7 @@ NFR2:  Epic 2 — one-directional key flow; the proxy holds what neither zone ma
 NFR3:  Epic 1 — OpenCode in a Kata VM, not merely a container
 NFR4:  Epic 3 — the guest is not trusted to comply; enforcement is proxy-side only
 NFR5:  Epic 5 — the single-chokepoint prediction is itself verified
-NFR6:  Epic 4 — 30s budget named as a tension against accepted Kata boot time
+NFR6:  Epic 4 — Story 4.4 measures the real time to a ready session and records it against the 30s budget
 NFR7:  Epic 4 — zero Docker knowledge; the user never types docker
 NFR8:  Epic 4 — direct interactive attach, not docker exec
 NFR9:  Epic 1 — labels on every bind mount; PRD's :Z-only wording amended to :Z/:z
@@ -299,12 +299,12 @@ healthy, and drops the user straight into the agent; leaving tears both containe
 `docker` once.
 
 **FRs covered:** FR26, FR27, FR29, FR30
-**NFRs covered:** NFR6 (carried as a standing constraint, not storied), NFR7, NFR8
+**NFRs covered:** NFR6 (measured and recorded, never optimized — Story 4.4), NFR7, NFR8
 **Architecture governed:** AD-14 (session lifecycle; the proxy dies with the agent), AD-16
 (single PATH entry)
 **Named tension:** the PRD's 30s readiness budget is in tension with accepted Kata boot time.
-If 30s cannot be met, that is a PRD conversation, and this epic is where the measurement
-surfaces — not a code fix.
+This epic is where the measurement surfaces — Story 4.4 times a real session and records the
+result against that budget. A miss is a PRD conversation, not a code fix.
 
 ### Epic 5: Proving the Security Claim
 
@@ -777,11 +777,29 @@ So that I can recover from an interrupted session without hunting for containers
 **And** both commands work whether or not a session was ever started, without erroring obscurely
 **And** neither command requires the user to know Docker
 
-> **NFR6 is carried as a standing constraint, not storied (deliberate).** The PRD budgets 30s
-> for a ready stack while also accepting Kata boot time as slow; the spine marks the budget untested
-> and names a failure as a PRD conversation rather than a code fix. No story here claims a startup
-> time, and performance tuning is explicitly out of MVP scope (NFR14). If 30s proves unreachable,
-> that is a PRD amendment — it is not a defect to optimize away inside this epic.
+### Story 4.4: Measure the time to a ready session, and record it
+
+As a product owner,
+I want the real time to a ready session measured and written down,
+So that the PRD's 30s budget is answered with a number instead of an assumption.
+
+**Acceptance Criteria:**
+
+**Given** a built guest image and a healthy host
+**When** `secureai opencode` is timed from invocation to the point the agent is ready to accept input
+**Then** the elapsed time is measured and reported
+**And** the measurement is decomposed — proxy start to healthy, Kata VM boot, agent ready — so the dominant cost is visible rather than averaged into a single number
+**And** a cold run and a warm run are distinguished, because Kata VM boot is the term in question
+**And** the result is recorded **against the PRD's 30s budget**, stated as met or not met, never as "close enough" or "acceptable"
+**And** a **miss changes no code**: performance tuning is out of MVP scope (NFR14), so a miss is recorded as a PRD amendment to discuss, not a defect to optimize away inside this epic
+**And** the number is recorded even when the budget is met, so a later change has a baseline to be compared against
+**And** the measurement is reported as a **measurement**, not as a guarantee — it characterizes one host on one day, and is not a claim about every developer machine
+
+> **This story produces a number, not a fix.** That is deliberate. The PRD both budgets 30s and
+> accepts that Kata boot is slow; the spine marks the budget untested and names a failure as a PRD
+> conversation. Measuring it settles a question the PRD left open, in either direction, without
+> pulling performance work — explicitly deferred under NFR14 — into an MVP whose value is
+> demonstrating isolation.
 
 ## Epic 5: Proving the Security Claim
 

@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 10-08-2026 10:07
-last_updated: 10-08-2026 10:07
+last_updated: 10-08-2026 10:18
 project: SecureAI
 project_key: NOKEY
 tracking_system: file-system
@@ -68,6 +68,7 @@ development_status:
   4-1-launch-an-interactive-session-not-an-exec: backlog
   4-2-the-proxy-dies-with-the-agent: backlog
   4-3-stop-and-inspect-the-stack: backlog
+  4-4-measure-the-time-to-a-ready-session-and-record-it: backlog
   epic-4-retrospective: optional
 
   epic-5: backlog
