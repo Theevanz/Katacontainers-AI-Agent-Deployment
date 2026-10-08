@@ -1,0 +1,4 @@
+# Per-machine BMAD tooling. Copied in from the local install so the
+# bmad skills can render a project-specific workflow; not source, and
+# not shared across machines.
+/_bmad/
