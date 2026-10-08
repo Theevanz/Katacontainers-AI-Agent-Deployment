@@ -273,13 +273,10 @@ write_daemon_json() {
   else
     printf '{}\n' >"$tmp"
   fi
-  python3 - "$tmp" "$time_ns_flag" <<PY
-# (unquoted heredoc on purpose: bash expands $SECUREAI_KATA_CONFIG_PATH
-# inside the python before python parses it; the block itself contains no
-# other `$`, and the ConfigPath value is validated by the loop above.)
-import json, sys
+  python3 - "$tmp" "$time_ns_flag" "${SECUREAI_KATA_CONFIG_PATH}" <<'PY'
+import json, os, sys
 
-path, time_ns_flag = sys.argv[1], sys.argv[2]
+path, time_ns_flag, kata_config = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path, "r", encoding="utf-8") as fh:
     try:
         cfg = json.load(fh)
@@ -293,7 +290,7 @@ if not isinstance(cfg, dict):
 cfg["runtimes"] = {
     "kata": {
         "runtimeType": "containerd-shim-kata-v2",
-        "options": {"ConfigPath": "$SECUREAI_KATA_CONFIG_PATH"},
+        "options": {"ConfigPath": kata_config},
     }
 }
 
@@ -346,7 +343,13 @@ fetch_one() {
     install -m 0644 "${SECUREAI_PAYLOAD_DIR}/${rel}" "$dest"
     return 0
   fi
-  local sibling="${BASH_SOURCE[0]%/*}/${rel}"
+  # `${BASH_SOURCE[0]%/*}` returns the script's OWN filename when there is no
+  # directory component (the common "bash install-fedora.sh" call), which
+  # would make every sibling a path inside a not-a-directory. Resolve it
+  # explicitly against the filesystem instead.
+  local script_dir
+  script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+  local sibling="${script_dir}/${rel}"
   if [[ -f "$sibling" ]]; then
     install -m 0644 "$sibling" "$dest"
     return 0
