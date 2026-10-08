@@ -15,7 +15,7 @@ FROM mitmproxy/mitmproxy:12.2.3
 # The entrypoint gosu-drops to the unprivileged `mitmproxy` user and forces
 # HOME=/home/mitmproxy. So the addon must be world-readable or the drop fails
 # with a permission error that looks like a broken proxy (Story 2.3).
-COPY --chmod=0644 addon.py /opt/secureai/addon.py
+COPY --chmod=0644 proxy/addon.py /opt/secureai/addon.py
 
 # Pin the unprivileged user's GID to SECUREAI_PROXY_GID (10001).
 #

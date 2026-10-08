@@ -111,8 +111,8 @@ RUN set -eux; \
         /home/node/.cache \
         /home/node/.local/state
 
-COPY opencode.json /home/node/.config/opencode/opencode.json
-COPY models.json /opt/opencode-catalog/models.json
+COPY opencode/opencode.json /home/node/.config/opencode/opencode.json
+COPY opencode/models.json /opt/opencode-catalog/models.json
 
 ENV OPENCODE_CONFIG=/home/node/.config/opencode/opencode.json \
     OPENCODE_MODELS_PATH=/opt/opencode-catalog/models.json \

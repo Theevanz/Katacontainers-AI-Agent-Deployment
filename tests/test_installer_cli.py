@@ -425,9 +425,11 @@ class TestCaBuildOrder(unittest.TestCase):
             if line.startswith("COPY ") and "--from=" not in line:
                 parts = line.split()
                 local_sources.add(parts[1])
-        # ca.pem arrives from the build context (/var/lib/secureai), not /opt.
+        # ca.pem arrives from the build context (/var/lib/secureai staged into
+        # app dir), not /opt; the others are installer-shipped tree files whose
+        # paths mirror the context's /opt/secureai layout.
         self.assertEqual(
-            local_sources, {"ca.pem", "opencode.json", "models.json"},
+            local_sources, {"ca.pem", "opencode/opencode.json", "opencode/models.json"},
             "unexpected local COPY sources in the guest Dockerfile",
         )
 
