@@ -1,0 +1,17 @@
+# SecureAI — proxy settings.
+#
+# Read by proxy/addon.py. This file is data, never policy: the allowlist lives
+# in whitelist.yaml and the keys in keys.yaml.
+
+# How long the addon may reuse a cached policy when config files have not
+# changed. This is what bounds staleness when a filesystem's mtime is too
+# coarse to detect an edit, and it is what makes `secureai whitelist add` take
+# effect in a running session within this many seconds (AD-13, F7).
+cache_ttl_seconds: 5
+
+# Whether plaintext http:// is permitted for an allowlisted host.
+#
+# false is the default and should stay that way: scheme is gated as well as
+# host, so an unencrypted path is not left unguarded (AR3, Story 3.2). Turning
+# this on is an explicit operator decision that widens the attack surface.
+allow_plaintext_http: false

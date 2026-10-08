@@ -1,0 +1,142 @@
+# SecureAI — the proxy: the ONLY enforcement point (AD-1).
+#
+# Runs in the TRUSTED zone on runc, never in the Kata VM. It is the only
+# process that ever holds a real API key, so its runtime is pinned explicitly:
+# if this service is ever drawn into the Kata VM, the trust boundary is gone
+# and every other guarantee here is void (AD-6).
+#
+# Every ${...} comes from /etc/secureai/compose.env (AD-11) -- including the host
+# paths, so `docker compose` behaves identically whether it is invoked by the
+# CLI or by hand. No literal value of a cross-boundary constant appears here.
+
+name: secureai
+
+services:
+  # ---------------------------------------------------------------- trusted
+  proxy:
+    runtime: runc            # EXPLICIT and load-bearing -- never remove (AD-6)
+    # The image this project BUILDS, not the upstream tag: the addon is copied
+    # in at build time, so pointing at upstream mitmproxy would leave mitmdump
+    # pointing at an addon path that does not exist in the image.
+    image: ${SECUREAI_PROXY_IMAGE}
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
+    container_name: secureai-proxy
+    restart: "no"            # the proxy must die with the agent (AD-14, F12)
+    command:
+      - mitmdump
+      - --listen-host=0.0.0.0
+      - --listen-port=${SECUREAI_PROXY_PORT}
+      # AD-12: the CA lives INSIDE the mounted path so that the certificate
+      # `secureai ca export` publishes -- and bakes into the guest image -- is
+      # the very certificate this proxy uses. A confdir outside the mount would
+      # make mitmproxy mint a fresh CA on every start, and then no TLS
+      # interception would ever validate against the guest's trust store.
+      - --set=confdir=/config/ca
+      - --set=flow_detail=0   # scrubbed at source; never log header values
+      - --set=termlog_verbosity=warning
+      - -s
+      - /opt/secureai/addon.py
+    environment:
+      # The proxy reads policy from the read-only runtime copy; it never writes
+      # config (AD-13). Its own CA dir is the single exception, and only because
+      # mitmproxy must persist a generated keypair across restarts.
+      SECUREAI_CONFIG_DIR: /config
+      SECUREAI_PLACEHOLDER_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+    volumes:
+      # :z because two services consume this path (proxy + opencode). A private
+      # :Z here would relabel on the second mount and break the first (AD-7).
+      - ${SECUREAI_VAR_DIR}:/config:z:ro
+      # The proxy owns its CA directory. :Z because this container is the ONLY
+      # consumer -- :z would relabel the shared /config parent underneath the
+      # other consumer. It is a sub-mount, so it stays inside the :z group of
+      # the directory above it and does not disturb it.
+      - ${SECUREAI_CA_DIR}:/config/ca:Z
+    networks:
+      secureai_net:
+        # Fixed IP: the Kata guest reaches the proxy by literal address, never
+        # by Compose service DNS, which does not exist inside the VM (AD-5).
+        ipv4_address: ${SECUREAI_PROXY_IP}
+    healthcheck:
+      # Exercises the proxy, not merely that the process is alive: a plain
+      # process check would report healthy before mitmproxy can serve (Story 2.6).
+      # Sending a real request through the proxy proves it answers on its port.
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import socket,sys;
+          s=socket.create_connection(("127.0.0.1", ${SECUREAI_PROXY_PORT}), 3);
+          s.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+          d=s.recv(64); s.close();
+          sys.exit(0 if d else 1)
+      interval: 2s
+      timeout: 5s
+      # Bounded so a proxy that never becomes healthy surfaces a readable
+      # error instead of hanging the session forever.
+      retries: 15
+      start_period: 5s
+
+  # -------------------------------------------------------------- untrusted
+  opencode:
+    runtime: kata            # the guest runs under its own kernel (AD-6, NFR3)
+    image: ${SECUREAI_OPENCODE_IMAGE}
+    build:
+      context: .
+      dockerfile: opencode/Dockerfile
+    container_name: secureai-opencode
+    restart: "no"
+    # Land the user INSIDE the agent -- not `compose up`, not `docker exec`
+    # (AD-14). The CLI supplies -it.
+    stdin_open: true
+    tty: true
+    depends_on:
+      proxy:
+        # The agent must not start until the proxy can actually serve, so the
+        # first request cannot race proxy boot (Story 2.6).
+        condition: service_healthy
+    environment:
+      # Placeholder only. The real key is substituted by the proxy on the way
+      # out and never travels back into the guest (AD-1, AD-10).
+      ANTHROPIC_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+      OPENAI_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+      HTTPS_PROXY: http://${SECUREAI_PROXY_IP}:${SECUREAI_PROXY_PORT}
+      HTTP_PROXY: http://${SECUREAI_PROXY_IP}:${SECUREAI_PROXY_PORT}
+      # Required: without it the TUI's loopback server call routes back
+      # through the proxy and deadlocks (AD-5 corollary).
+      NO_PROXY: localhost,127.0.0.1,::1
+      # Vendored model catalog -- models.opencode.ai leaves the allowlist (AD-8).
+      OPENCODE_DISABLE_MODELS_FETCH: "1"
+      XDG_CONFIG_HOME: /home/node/.config
+      XDG_DATA_HOME: /home/node/.local/share
+      XDG_CACHE_HOME: /home/node/.cache
+      XDG_STATE_HOME: /home/node/.local/state
+    volumes:
+      # Session workspace is the only writable guest path; :Z (single consumer).
+      - ${SECUREAI_WORKSPACE}:/home/node/.local/share/opencode:Z
+      # Read-only config the guest never needs; :z (shared with proxy).
+      - ${SECUREAI_VAR_DIR}:/config:z:ro
+    networks:
+      secureai_net:
+        ipv4_address: ${SECUREAI_OPENCODE_IP}
+    # AD-5: upstream name resolution is guest-local and carries no enforcement
+    # meaning. Docker's embedded resolver does NOT exist inside a Kata VM, so the
+    # guest's DNS points at the bridge gateway instead (kata#6688). This is a
+    # SERVICE-level key -- inside the service, not under the network mapping.
+    dns:
+      - ${SECUREAI_GATEWAY}
+
+networks:
+  secureai_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${SECUREAI_SUBNET}
+    # OPEN: whether `internal: true` applies to the Kata VM's tap device is the
+    # BLOCKING question of the whole design. If it does, the guest has no route
+    # out and AD-1's accepted risk is void. If it does not, this is false
+    # comfort. It is deliberately LEFT UNSET rather than set to a guessed value:
+    # `secureai verify` measures the effect of flipping it (Story 5.5), and a
+    # guessed setting would read as a guarantee that was never measured.

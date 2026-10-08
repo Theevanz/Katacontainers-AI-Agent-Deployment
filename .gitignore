@@ -2,3 +2,8 @@
 # bmad skills can render a project-specific workflow; not source, and
 # not shared across machines.
 /_bmad/
+
+# Python bytecode from the addon test suite. Not source, and a stale .pyc can
+# make a repo-wide grep report a string that no longer exists in any source.
+__pycache__/
+*.py[cod]

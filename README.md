@@ -4,10 +4,12 @@
 > This repository demonstrates the concept on Fedora. It is not production-hardened
 > and is not supported on any other platform. Do not rely on it for production use.
 
-> **Status: not yet implemented.** This repository currently contains planning
-> artifacts only — no `install-fedora.sh`, no `docker-compose.yml`, no CLI. The install
-> command below will not work until Story 1.1 is built. What *is* settled is the design;
-> see [Documentation](#documentation).
+> **Status: designed and implemented as a build substrate.** The prose in this
+> file is the product contract; the code lives in the repo root under
+> `install-fedora.sh`, `secureai`, `docker-compose.yml`, `opencode/`, `proxy/`,
+> `config/`, and `tests/`. AD-16 pins exactly five runtime paths in
+> `/usr/local/bin`, `/opt/secureai`, `/etc/secureai`, `/var/lib/secureai`, and
+> Docker's own state directory — the checkout is never referenced at runtime.
 
 ## What it is
 
@@ -52,18 +54,28 @@ Installs machine-wide and root-owned. There is no `git clone` prerequisite and n
 per-user variant — the checkout is never referenced at runtime. Re-running is
 idempotent.
 
+After install, the image build needs the CA first, and every command that writes
+root-owned config needs sudo:
+
+```bash
+sudo secureai ca export   # produce the interception CA
+sudo secureai build       # build proxy + guest images (bakes the CA in)
+sudo secureai opencode    # start a session
+```
+
 ## Use
 
 ```bash
-secureai opencode                 # launch an interactive session
-secureai whitelist add example.com # allow an extra domain (live, no restart)
+sudo secureai opencode                 # launch an interactive session
+sudo secureai whitelist add example.com # allow an extra domain (live, no restart)
 secureai whitelist list            # show current allowlist
-secureai keys set api.anthropic.com sk-ant-...   # store a key
+sudo secureai keys set api.anthropic.com sk-ant-...   # store a key
 secureai keys list                 # show hosts, values masked
-secureai ca export                 # export the mitm CA (must run before image build)
-secureai verify                    # run the four isolation gates
+sudo secureai ca export            # export the mitm CA (must run before image build)
+sudo secureai build                # build proxy + guest images
+sudo secureai verify               # run the gates and the open-question probes
 secureai status                    # check if the stack is running
-secureai down                      # stop and remove containers
+sudo secureai down                 # stop and remove containers
 ```
 
 The user never types `docker`. Config lives in `/etc/secureai` (`0640 root:root`) and
@@ -162,7 +174,8 @@ the system, and each is carried as a story rather than an assumption.
 
 Not addressed in this proof of concept:
 
-- no automated tests or CI
+- no CI pipeline (the unit suite in `tests/` is runnable locally, but no hosted
+  CI is wired)
 - no upgrade or migration path
 - no multi-user key management
 - no performance tuning (Kata VM boot is slow; the PRD's 30s readiness budget is in

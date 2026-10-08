@@ -1,0 +1,21 @@
+{
+  "$comment": "Vendored model catalog (AD-8). Pre-seeded at build time so models.opencode.ai can leave the allowlist entirely. Regenerate with: opencode models > models.json on a connected machine, then rebuild.",
+  "anthropic": {
+    "claude-sonnet-4-20250514": {
+      "name": "Claude Sonnet 4",
+      "attachment": true,
+      "reasoning": true,
+      "temperature": true,
+      "limit": { "context": 200000, "output": 64000 }
+    }
+  },
+  "openai": {
+    "gpt-4o": {
+      "name": "GPT-4o",
+      "attachment": true,
+      "reasoning": false,
+      "temperature": true,
+      "limit": { "context": 128000, "output": 16384 }
+    }
+  }
+}

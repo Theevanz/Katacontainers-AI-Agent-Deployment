@@ -1,0 +1,1074 @@
+#!/usr/bin/env bash
+# secureai -- the single interactive surface. The user never types `docker` (F5, NFR7).
+#
+# This CLI is the SOLE WRITER of /etc/secureai (AD-13). The proxy mounts a
+# read-only runtime copy and never writes config; the installer creates the
+# compose.env file but never populates it (AD-11). install-fedora.sh is the sole
+# writer of /etc/docker/daemon.json and this script never touches it (AD-6).
+#
+# Bash throughout -- no `yq`, no new language dependency (FR43).
+
+set -euo pipefail
+
+# --- the installed layout (AD-16). These five paths are the whole contract. --
+readonly SECUREAI_BIN="/usr/local/bin/secureai"
+readonly SECUREAI_APP_DIR="/opt/secureai"
+readonly SECUREAI_ETC="/etc/secureai"
+readonly SECUREAI_VAR="/var/lib/secureai"
+readonly SECUREAI_COMPOSE_ENV="${SECUREAI_ETC}/compose.env"
+readonly SECUREAI_COMPOSE_FILE="${SECUREAI_APP_DIR}/docker-compose.yml"
+readonly SECUREAI_WORKSPACE="${SECUREAI_VAR}/workspace"
+readonly SECUREAI_CA="${SECUREAI_VAR}/ca.pem"
+
+# The nine reviewed hosts of AD-15. Seeded on first run so a fresh install works
+# out of the box. This list is duplicated in config/whitelist.yaml and README.md
+# on purpose: it is the documented default allowlist, and documentation that
+# disagrees with behaviour is worse than no documentation (Story 3.4).
+readonly -a SECUREAI_BASELINE_ALLOWLIST=(
+  "api.anthropic.com"
+  "github.com"
+  "*.githubusercontent.com"
+  "registry.npmjs.org"
+  "pypi.org"
+  "files.pythonhosted.org"
+  "models.dev"
+  "opencode.ai"
+  "astral.sh"
+)
+
+readonly SECUREAI_PROXY_CONTAINER="secureai-proxy"
+readonly SECUREAI_OPENCODE_CONTAINER="secureai-opencode"
+
+# GID that the proxy container's unprivileged user belongs to. Defined in
+# config/compose.env (the single source); this default only lets the config
+# bootstrapping below run before compose.env is first sourced. Sourcing
+# compose.env afterwards overrides it with the authoritative value.
+: "${SECUREAI_PROXY_GID:=10001}"
+export SECUREAI_PROXY_GID
+
+# --- output helpers ------------------------------------------------------
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+ok()   { printf '    ok  %s\n' "$*"; }
+warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m error\033[0m %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die \
+"Most SecureAI commands write root-owned files under ${SECUREAI_ETC}.
+ Run this command with sudo, e.g.  sudo secureai ${1:-<command>}."
+}
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die \
+"docker was not found on PATH.
+ SecureAI manages Docker for you -- there is no need to run it yourself -- but
+ it must be installed. On Fedora:  sudo dnf install docker"
+}
+
+# =========================================================================
+# Config ownership (AD-11, AD-13)
+# =========================================================================
+
+# Seed /etc/secureai/compose.env from the shipped template on FIRST run only.
+# Re-running preserves existing values, so an operator's edit is never lost.
+ensure_compose_env() {
+  if [[ ! -f "$SECUREAI_COMPOSE_ENV" ]]; then
+    local template="${SECUREAI_APP_DIR}/config/compose.env"
+    if [[ -f "$template" ]]; then
+      install -m 0640 "$template" "$SECUREAI_COMPOSE_ENV"
+      ok "seeded ${SECUREAI_COMPOSE_ENV}"
+    else
+      die "${SECUREAI_COMPOSE_ENV} is missing and no template was found at
+     ${template}. Re-run install-fedora.sh."
+    fi
+  fi
+  chmod 0640 "$SECUREAI_COMPOSE_ENV" 2>/dev/null || true
+  chown root:root "$SECUREAI_COMPOSE_ENV" 2>/dev/null || true
+}
+
+# Load the cross-boundary constants into the environment before invoking
+# `docker compose`. Compose reads them from the environment too, which is why
+# the same values are referenced as ${...} there and only here (AD-11).
+load_compose_env() {
+  ensure_compose_env
+  set -a
+  # shellcheck disable=SC1090
+  . "$SECUREAI_COMPOSE_ENV"
+  set +a
+  local name
+  # Every value compose consumes and every host path the bind mounts bind to.
+  # Missing any of these produces an opaque interpolation error from compose
+  # instead of a message that names the fix.
+  for name in \
+    SECUREAI_SUBNET SECUREAI_GATEWAY SECUREAI_PROXY_IP SECUREAI_PROXY_PORT \
+    SECUREAI_PLACEHOLDER_KEY SECUREAI_PROXY_IMAGE SECUREAI_OPENCODE_IMAGE \
+    SECUREAI_VAR_DIR SECUREAI_WORKSPACE SECUREAI_CA_DIR SECUREAI_PROXY_GID \
+    SECUREAI_ETC_DIR SECUREAI_OPENCODE_IP; do
+    [[ -n "${!name:-}" ]] || die \
+"${SECUREAI_COMPOSE_ENV} does not define ${name}.
+ That file is the single source of the cross-boundary constants (AD-11).
+ Restore it, or delete it and re-run this command to re-seed it."
+  done
+  export SECUREAI_PROXY_GID
+}
+
+compose() {
+  load_compose_env
+  docker compose --project-name secureai --file "$SECUREAI_COMPOSE_FILE" "$@"
+}
+
+# --- YAML helpers, without yq (FR43) -------------------------------------
+# A tiny reader for the two shapes we own: a `- item` list and `"host": "val"`.
+# Reading is deliberately strict: a value we cannot parse is an error, never a
+# silent default, because the alternative is a broken allowlist that looks fine.
+yaml_list() {
+  sed -e 's/#.*$//' -e 's/^[[:space:]]*-[[:space:]]*//' "$1" \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' \
+    | grep -v '^$' || true
+}
+
+yaml_pairs() {
+  sed -e 's/#.*$//' "$1" \
+    | grep -E '^[[:space:]]*"?[^"]+"?[[:space:]]*:' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' || true
+}
+
+# Mirror a file into the runtime copy the proxy reads. Atomic replace (temp +
+# mv) -- a plain redirect truncates in place, so a flow racing the write would
+# read a partial allowlist/keys file and spuriously fail closed.
+sync_to_runtime() {
+  local name="$1"
+  local src="${SECUREAI_ETC}/${name}"
+  local dst="${SECUREAI_VAR}/${name}"
+  [[ -f "$src" ]] || return 0
+  local tmp
+  tmp="$(mktemp "${dst}.XXXXXX")"
+  cp "$src" "$tmp"
+  chown root:"$SECUREAI_PROXY_GID" "$tmp"
+  chmod 0640 "$tmp"
+  mv -f "$tmp" "$dst"
+}
+
+# =========================================================================
+# commands
+# =========================================================================
+
+cmd_init_config() {
+  log "Initialising SecureAI configuration in ${SECUREAI_ETC}"
+  install -d -m 0700 -o root -g root "$SECUREAI_ETC"
+  # 0750 root:proxy -- the /var/lib/secureai directory holds the runtime copy
+  # that the proxy bind-mounts. The proxy runs as a non-root user (gosu-drop),
+  # so a 0700 root:root directory would be unreadable by the very process that
+  # enforces every request (which would then fail closed with config-error).
+  # Grouping it to the proxy gid keeps it unreadable to everyone else (AD-7).
+  install -d -m 0750 -o root -g "$SECUREAI_PROXY_GID" "$SECUREAI_VAR"
+  install -d -m 2770 -o root -g "$SECUREAI_PROXY_GID" "${SECUREAI_VAR}/ca"
+  # The session workspace is the guest's writable path; the guest runs as node.
+  install -d -m 0700 -o root -g root "$SECUREAI_WORKSPACE"
+
+  ensure_compose_env
+
+  # Seed the owned allowlist baseline only if absent -- an operator's narrowed
+  # list must survive a re-run (AD-15).
+  if [[ ! -f "${SECUREAI_ETC}/whitelist.yaml" ]]; then
+    {
+      printf '%s\n' \
+"# SecureAI egress allowlist. One host per line; *.example.com matches" \
+"# subdomains. Mutate with 'secureai whitelist add'."
+      local host
+      for host in "${SECUREAI_BASELINE_ALLOWLIST[@]}"; do
+        printf -- '- "%s"\n' "$host"
+      done
+    } >"${SECUREAI_ETC}/whitelist.yaml"
+    chmod 0640 "${SECUREAI_ETC}/whitelist.yaml"
+    chown root:root "${SECUREAI_ETC}/whitelist.yaml"
+    ok "seeded the 9-host allowlist baseline"
+  fi
+
+  [[ -f "${SECUREAI_ETC}/settings.yaml" ]] || {
+    if [[ -f "${SECUREAI_APP_DIR}/config/settings.yaml" ]]; then
+      install -m 0640 "${SECUREAI_APP_DIR}/config/settings.yaml" "${SECUREAI_ETC}/settings.yaml"
+    fi
+  }
+
+  [[ -f "${SECUREAI_ETC}/keys.yaml" ]] || {
+    local template="${SECUREAI_APP_DIR}/config/keys.yaml.template"
+    if [[ -f "$template" ]]; then
+      install -m 0640 "$template" "${SECUREAI_ETC}/keys.yaml"
+    else
+      printf '{}\n' >"${SECUREAI_ETC}/keys.yaml"
+      chmod 0640 "${SECUREAI_ETC}/keys.yaml"
+    fi
+    chown root:root "${SECUREAI_ETC}/keys.yaml"
+  }
+
+  # SINGLE sync, for EVERY file that exists in /etc -- not only files we just
+  # seeded. The critical case is the one where the installer ALREADY populated
+  # /etc/secureai: then the seed branches above all skip, and nothing would be
+  # mirrored to /var/lib, leaving the proxy's /config empty and forcing a
+  # 403 config-error on every request.
+  local name
+  for name in whitelist.yaml settings.yaml keys.yaml; do
+    if [[ -f "${SECUREAI_ETC}/${name}" ]]; then
+      sync_to_runtime "$name"
+    fi
+  done
+  ok "configuration ready and mirrored to ${SECUREAI_VAR}"
+}
+
+cmd_whitelist_add() {
+  local host="${1:-}"
+  [[ -n "$host" ]] || die "usage: secureai whitelist add <domain>"
+  # A domain is a hostname; refusing anything else keeps a typo or a URL from
+  # silently becoming an unmatchable entry.
+  [[ "$host" =~ ^[A-Za-z0-9*._-]+$ ]] \
+    || die "'${host}' is not a valid domain or wildcard pattern."
+  # A bare '*' or 'foo*' is accepted by the charset regex but can never match
+  # anything under the allowlist's matching rule (`*.x` only matches real
+  # subdomains, never apex) -- so refuse patterns that would fool the operator.
+  case "$host" in
+    \*)                        die "'*' is not a valid allowlist entry." ;;
+    *\**)                      [[ "$host" == \*.* ]] || die "'*' is only supported as a leading '*.'" ;;
+  esac
+  host="${host,,}"
+
+  need_root
+  cmd_init_config >/dev/null
+
+  if yaml_list "${SECUREAI_ETC}/whitelist.yaml" | grep -qxF -- "$host"; then
+    warn "${host} is already allowed."
+    return 0
+  fi
+  local target="${SECUREAI_ETC}/whitelist.yaml"
+  # The shipped baseline and any earlier write may not end in a newline -- and
+  # appending after a final line that lacks one concatenates the two entries
+  # into an unparseable YAML fragment, which turns every request into a 403.
+  # So end the file on a newline before appending, whichever way it arrived.
+  if [[ -s "$target" && -n "$(tail -c1 "$target")" ]]; then
+    printf '\n' >>"$target"
+  fi
+  # Quoted because a bare `- *.example.com` is a YAML scanner error, which would
+  # make the proxy fail closed on every request.
+  printf -- '- "%s"\n' "$host" >>"$target"
+  sync_to_runtime whitelist.yaml
+  ok "${host} added"
+  # The proxy is never signalled to reload -- it does not accept instructions.
+  # It re-reads this file per flow within cache_ttl_seconds, so a running
+  # session picks this up with no restart (AD-13, F7).
+  ok "synced to ${SECUREAI_VAR}; a running session picks this up within seconds"
+  # Audit line: the allowlist IS the attack surface, so every mutation is dated.
+  printf '%s whitelist add %s\n' "$(date -Is)" "$host" \
+    >>"${SECUREAI_VAR}/whitelist.audit.log"
+}
+
+cmd_whitelist_list() {
+  cmd_init_config >/dev/null 2>&1 || true
+  local runtime="${SECUREAI_VAR}/whitelist.yaml"
+  local source_file="$runtime"
+  # Report the synced file, because that is what the proxy is actually reading.
+  [[ -f "$runtime" ]] || source_file="${SECUREAI_ETC}/whitelist.yaml"
+
+  if [[ ! -f "$source_file" ]]; then
+    die "No allowlist found. Expected ${SECUREAI_ETC}/whitelist.yaml.
+ Run 'sudo secureai whitelist add <domain>' to create one."
+  fi
+
+  local entries
+  entries="$(yaml_list "$source_file")"
+  if [[ -z "$entries" ]]; then
+    warn "${source_file} is empty -- every host is currently blocked."
+    return 0
+  fi
+
+  log "Allowed hosts (from ${source_file})"
+  printf '%s\n' "$entries" | while IFS= read -r host; do
+    printf '    %s\n' "$host"
+  done
+  printf '\n  %s host(s) allowed.\n' "$(printf '%s\n' "$entries" | grep -c . || true)"
+  printf '  Narrow this list to reduce the agent attack surface.\n'
+}
+
+cmd_keys_set() {
+  local host="${1:-}" key="${2:-}"
+  [[ -n "$host" && -n "$key" ]] || die "usage: secureai keys set <host> <key>"
+  host="${host,,}"
+  # Accept only a hostname or a wildcard pattern: this host is later used as a
+  # pattern in the allowlist, so a malformed or glob-laden value would create a
+  # key that can never be matched -- while looking configured.
+  [[ "$host" =~ ^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] \
+    || die "'${host}' is not a valid host name or '*.'-wildcard pattern."
+  need_root
+  cmd_init_config >/dev/null
+
+  # Rewrite the whole file: an in-place edit would have to handle quoting and
+  # escaping of arbitrary key characters, which is a bad place to be clever.
+  local tmp
+  tmp="$(mktemp)"
+  # Emit every existing entry EXCEPT this host, matching exactly the two key
+  # shapes we write ("host": "val" as one or two tokens). Use -F so a host
+  # containing a regex metacharacter cannot match unintended lines.
+  if [[ -f "${SECUREAI_ETC}/keys.yaml" ]]; then
+    while IFS= read -r line; do
+      local h
+      h="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*"\?//' -e 's/"\?:.*$//' -e 's/:.*$//')"
+      [[ "$h" == "$host" ]] || printf '%s\n' "$line"
+    done <"${SECUREAI_ETC}/keys.yaml" >"$tmp"
+  fi
+  # Escape the two characters that matter inside a YAML double-quoted scalar:
+  # backslash and the closing double quote. A raw value containing either would
+  # otherwise produce a keys.yaml the addon cannot parse, and every request
+  # would fail closed with config-error.
+  local escaped_key
+  escaped_key="$(printf '%s' "$key" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  printf '"%s": "%s"\n' "$host" "$escaped_key" >>"$tmp"
+  # 0640 root:proxy-gid -- the runtime copy must stay readable by the proxy
+  # without becoming world-readable (AD-13).
+  install -m 0640 -o root -g "$SECUREAI_PROXY_GID" "$tmp" "${SECUREAI_ETC}/keys.yaml"
+  chown root:root "${SECUREAI_ETC}/keys.yaml" || true
+  rm -f "$tmp"
+  sync_to_runtime keys.yaml
+  ok "key stored for ${host}"
+  ok "synced to ${SECUREAI_VAR} (the proxy's only read path)"
+  # The value is never echoed back -- not here, not in the audit log, not in
+  # scrollback. Only the 4-char fingerprint is recorded, which is what the
+  # injection line carries (AD-10).
+  ok "fingerprint $(printf '%s' "$key" | sha256sum | cut -c1-4)"
+}
+
+cmd_keys_list() {
+  cmd_init_config >/dev/null 2>&1 || true
+  local keys_file="${SECUREAI_ETC}/keys.yaml"
+  [[ -r "$keys_file" ]] || die \
+"${keys_file} is not readable. Either it does not exist, or this shell is not
+ privileged enough to read root-only config. Run this command with sudo."
+  [[ -f "$keys_file" ]] || {
+    warn "No keys file yet. Add one with: secureai keys set <host> <key>"
+    return 0
+  }
+
+  local pairs found=0
+  pairs="$(yaml_pairs "${SECUREAI_ETC}/keys.yaml")"
+  [[ -n "$pairs" ]] || { warn "No keys configured."; return 0; }
+
+  log "Stored keys (values masked)"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local host value
+    host="$(printf '%s' "$line" | sed -e 's/:.*$//' -e 's/^"\(.*\)"$/\1/')"
+    value="$(printf '%s' "$line" | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/^"\(.*\)"$/\1/')"
+    found=1
+    if [[ -z "$value" ]]; then
+      printf '    %-40s %s\n' "$host" "(not set -- requests will be denied)"
+    else
+      # Mask EVERYTHING but the 4-char fingerprint. The earlier shape put the
+      # last four characters after the asterisks -- readable, and enough to
+      # narrow a leaked key -- so it is gone (AD-13, AD-10).
+      printf '    %-40s %s\n' "$host" "********  fp=$(printf '%s' "$value" | sha256sum | cut -c1-4)"
+    fi
+  done <<<"$pairs"
+  [[ "$found" -eq 1 ]] || warn "No keys configured."
+  printf '\n  Values are always masked. No command prints a raw key.\n'
+}
+
+# --- CA export (AD-12) ---------------------------------------------------
+# One producer, one build order: this must run BEFORE `docker build` of the
+# guest image, which bakes the CA into the system trust store. It is never
+# bind-mounted into a running container.
+cmd_ca_export() {
+  need_root
+  need_docker
+  load_compose_env
+
+  log "Exporting the interception CA (confdir=${SECUREAI_VAR}/ca)"
+  # 2770: group-write so the proxy container's unprivileged user (gid 10001)
+  # can create the CA keypair here -- this SAME directory is the proxy's
+  # confdir, so the exported CA and the proxy's live CA are one and the same.
+  install -d -m 2770 -o root -g "$SECUREAI_PROXY_GID" "${SECUREAI_VAR}/ca"
+
+  # Re-running must NOT invalidate trust already baked into a guest image.
+  # mitmproxy reuses the CA in confdir, so the fingerprint stays stable.
+  local existing="${SECUREAI_VAR}/ca/mitmproxy-ca-cert.pem"
+  if [[ -f "$existing" ]]; then
+    install -m 0644 "$existing" "$SECUREAI_CA"
+    ok "reused the existing CA -- trust baked into guest images stays valid"
+  else
+    # One-shot container; it generates the CA on first run and exits.
+    docker run --rm \
+      --name secureai-ca-export \
+      --network none \
+      -v "${SECUREAI_VAR}/ca:/config/ca:Z" \
+      "${SECUREAI_PROXY_IMAGE}" \
+      mitmdump --set confdir=/config/ca --set termlog_verbosity=error \
+               --set flow_detail=0 -h >/dev/null 2>&1 || true
+    [[ -f "$existing" ]] || die "CA generation produced no ${existing}.
+ Check that the proxy image ${SECUREAI_PROXY_IMAGE} could be pulled."
+    install -m 0644 "$existing" "$SECUREAI_CA"
+    ok "generated a new CA"
+  fi
+
+  # Only the PUBLIC certificate leaves. The private key stays in
+  # ${SECUREAI_VAR}/ca and never enters the guest.
+  chmod 0644 "$SECUREAI_CA"
+  ok "public CA written to ${SECUREAI_CA}"
+  ok "the private key stays in ${SECUREAI_VAR}/ca and never leaves the proxy"
+  printf '\n  Build both images now with:  sudo secureai build\n'
+}
+
+# --- build ---------------------------------------------------------------
+# The one command that produces BOTH images a session needs. It also stages the
+# exported CA into the build context so the guest image can bake it into the
+# system trust store (AD-12) -- which is why `ca export` must run first.
+cmd_build() {
+  need_root
+  need_docker
+  need_root
+  cmd_init_config >/dev/null
+  load_compose_env
+
+  if [[ ! -f "$SECUREAI_CA" ]]; then
+    die "No interception CA at ${SECUREAI_CA}.
+ Run 'sudo secureai ca export' before building the guest image.
+ The build refuses to proceed without it because the CA is baked into the
+ guest's system trust store at image build time (AD-12)."
+  fi
+
+  # The proxy image must be built before anything uses ${SECUREAI_PROXY_IMAGE}:
+  # that tag is THIS project's image, which carries proxy/addon.py -- not the
+  # upstream mitmproxy tag, which does not contain the addon and which the used
+  # to point at has no business serving these flows.
+  log "Building the proxy image ${SECUREAI_PROXY_IMAGE}"
+  DOCKER_BUILDKIT=1 docker build \
+    --tag "${SECUREAI_PROXY_IMAGE}" \
+    --build-arg "SECUREAI_PROXY_GID=${SECUREAI_PROXY_GID}" \
+    --file "${SECUREAI_APP_DIR}/proxy/Dockerfile" \
+    "${SECUREAI_APP_DIR}" || die "Proxy image build failed."
+
+  # The guest image build context is the app tree, which must contain ca.pem.
+  # Stage it from the runtime copy so a missing CA fails here with a readable
+  # instruction instead of as an opaque Dockerfile COPY error.
+  cp "$SECUREAI_CA" "${SECUREAI_APP_DIR}/ca.pem"
+  chmod 0644 "${SECUREAI_APP_DIR}/ca.pem"
+
+  log "Building the guest image ${SECUREAI_OPENCODE_IMAGE}"
+  DOCKER_BUILDKIT=1 docker build \
+    --tag "${SECUREAI_OPENCODE_IMAGE}" \
+    --file "${SECUREAI_APP_DIR}/opencode/Dockerfile" \
+    "${SECUREAI_APP_DIR}" || die "Guest image build failed.
+ If the error mentions the toolchain, you are probably not on a Debian glibc
+ base -- but you should never see that, because this Dockerfile base is pinned."
+  ok "guest image built with the interception CA baked in"
+  printf '\n  You are ready. Start a session with:  sudo secureai opencode\n'
+}
+
+# --- session lifecycle (AD-14) -------------------------------------------
+
+# AD-6: assert the trust-critical pin before starting anything. If the proxy
+# service ever loses `runtime: runc`, it could be drawn into the Kata VM --
+# where the agent, not the proxy, would hold the keys.
+assert_proxy_runtime_pinned() {
+  local source="$SECUREAI_COMPOSE_FILE"
+  [[ -f "$source" ]] || die "compose file not found: $source"
+
+  # The trust-critical claim is not "the file mentions runc somewhere" but
+  # "the PROXY service is pinned to runc". A file that sets opencode: runc and
+  # drops the proxy's pin must FAIL this check -- so extract the proxy service
+  # block specifically and require a runtime: runc inside it.
+  local proxy_block
+  proxy_block="$(awk '/^  proxy:/{f=1; print; next} f && /^  [a-zA-Z_]+:/{exit} f' "$source")"
+  if [[ -z "$proxy_block" ]]; then
+    die "No 'proxy' service found in ${source}. Refusing to start a session."
+  fi
+  if ! grep -Eq '^[[:space:]]*runtime:[[:space:]]*runc\b' <<<"$proxy_block"; then
+    die \
+"The 'proxy' service in ${source} does not declare 'runtime: runc'.
+ This pin is what keeps the key-holding proxy out of the Kata VM (AD-6).
+ Refusing to start a session that could put your keys inside the guest."
+  fi
+  ok "proxy service is pinned to runc"
+
+  # The opencode service must be the Kata one; a SWAPPED pair (proxy on kata,
+  # agent on runc) must also fail.
+  local opencode_block
+  opencode_block="$(awk '/^  opencode:/{f=1; print; next} f && /^  [a-zA-Z_]+:/{exit} f' "$source")"
+  if ! grep -Eq '^[[:space:]]*runtime:[[:space:]]*kata\b' <<<"$opencode_block"; then
+    die \
+"The 'opencode' service in ${source} does not declare 'runtime: kata'.
+ The agent must run in the VM; the proxy must not. Refusing to start."
+  fi
+  ok "opencode service is pinned to kata"
+
+  # The compose file must not let a stray default-runtime change the meaning.
+  if grep -q 'default-runtime' "$source"; then
+    die "${source} mentions default-runtime.
+ That would move the proxy into the Kata VM. Refusing to start."
+  fi
+
+  # The CLI itself must not pass a runtime-override flag: such a flag silently
+  # overrides the compose field with no error, which is exactly the failure
+  # AD-6 warns about. The needle is assembled from two halves so this guard
+  # does not match its own source line.
+  local override_flag
+  override_flag="--""runtime"
+  if grep -v '^[[:space:]]*#' "${BASH_SOURCE[0]}" | grep -q -- "$override_flag"; then
+    die "This CLI passes a runtime-override flag, which would override the
+ compose declaration silently. Refusing to start."
+  fi
+  ok "no runtime override in the CLI"
+}
+
+# Declared-but-unregistered runtimes fail the session with a readable message
+# rather than a raw Docker error (Story 2.3).
+assert_runtime_registered() {
+  local name="$1"
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q "\"$name\"" \
+    || die \
+"Docker has no runtime named '${name}' registered on this host.
+ A Kata session cannot start until install-fedora.sh has wired it into
+ /etc/docker/daemon.json and Docker has been restarted:
+   sudo systemctl restart docker
+ Then re-run 'secureai status' to confirm the pairing."
+  ok "runtime '${name}' is registered"
+}
+
+# AD-14: the session is a pair. Both containers carry --rm, and a trap tears
+# the pair down on INT/TERM so nothing is orphaned. No systemd unit
+# auto-starts the proxy -- that would contradict per-session containment (F12).
+SESSION_ACTIVE=0
+teardown_session() {
+  printf '\n'
+  log "Tearing down the session"
+  # Preserve the proxy's log BEFORE removing the container: `secureai opencode`
+  # tears both containers down when the session ends, and `secureai verify`
+  # must still be able to report what that session's proxy saw and injected.
+  # Without this the two commands worked together only if the agent were left
+  # running -- and a clean session start proves nothing on its own.
+  docker logs "$SECUREAI_PROXY_CONTAINER" >"${SECUREAI_VAR}/proxy.log" 2>&1 || true
+  # Stop the guest first: it is the one holding an interactive TTY.
+  docker rm -f "$SECUREAI_OPENCODE_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$SECUREAI_PROXY_CONTAINER" >/dev/null 2>&1 || true
+  ok "both containers removed; this session's proxy log is at ${SECUREAI_VAR}/proxy.log"
+  SESSION_ACTIVE=0
+}
+
+cmd_opencode() {
+  need_root
+  need_docker
+  cmd_init_config >/dev/null
+  load_compose_env
+  assert_proxy_runtime_pinned
+  assert_runtime_registered kata
+  assert_runtime_registered runc
+
+  # An interactive session is a terminal contract: with no TTY, `-it` fails
+  # with docker's "input device is not a TTY" rather than with a message that
+  # points at the fix.
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    die "secureai opencode needs an interactive terminal (stdin and stdout must be a TTY).
+ Run it from your shell, not from a pipe or a background job."
+  fi
+
+  # If the guest image was never built, `compose run` pulls it or errors with a
+  # raw docker failure. Saying it plainly first is the readable version.
+  if ! docker image inspect "$SECUREAI_OPENCODE_IMAGE" >/dev/null 2>&1; then
+    die "The guest image '${SECUREAI_OPENCODE_IMAGE}' is not built.
+ Run:  sudo secureai build
+ (build requires the CA first: sudo secureai ca export)."
+  fi
+  if ! docker image inspect "$SECUREAI_PROXY_IMAGE" >/dev/null 2>&1; then
+    die "The proxy image '${SECUREAI_PROXY_IMAGE}' is not built.
+ Run:  sudo secureai build"
+  fi
+
+  if [[ ! -f "$SECUREAI_CA" ]]; then
+    warn "No CA at ${SECUREAI_CA}. The guest image must have it baked in;
+     if you have not built since exporting a CA, interception will fail closed."
+  fi
+
+  # The trap must also cover EXIT and HUP: a closed terminal or an unhandled
+  # signal must not leave the proxy (which holds the real keys) running.
+  trap teardown_session EXIT
+  trap 'teardown_session; exit 130' INT TERM HUP
+
+  log "Starting the proxy and waiting for it to become healthy"
+  # `run --rm` (not `up`) so the proxy is a session member and dies with the
+  # agent. Detached so the guest can wait on its healthcheck.
+  local session_start_s="$SECONDS" proxy_start_s="$SECONDS"
+  compose run --rm -d --name "$SECUREAI_PROXY_CONTAINER" proxy \
+    || die "The proxy could not start.
+ Read the cause above. The agent will not start against a proxy that failed."
+
+  # Bounded wait: a proxy that never becomes healthy must surface a readable
+  # error, not hang the session forever (Story 2.6). The container's own
+  # health status is authoritative -- `compose ps` does not reliably list
+  # one-shot `run` containers, so using it here would report "never healthy"
+  # for a proxy that is in fact up.
+  log "Waiting for the proxy to answer"
+  local waited=0 healthy=0
+  while (( waited < 60 )); do
+    if [[ "$(docker inspect --format '{{.State.Health.Status}}' "$SECUREAI_PROXY_CONTAINER" 2>/dev/null)" == "healthy" ]]; then
+      healthy=1
+      break
+    fi
+    # Bail early if the container already exited -- waiting out the full 60s
+    # for a dead proxy is a worse error than reading its logs.
+    if [[ "$(docker inspect --format '{{.State.Status}}' "$SECUREAI_PROXY_CONTAINER" 2>/dev/null)" == "exited" ]]; then
+      break
+    fi
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+  if [[ "$healthy" -ne 1 ]]; then
+    log "Proxy logs:"
+    docker logs "$SECUREAI_PROXY_CONTAINER" 2>&1 | tail -20 || true
+    teardown_session
+    die "The proxy did not become healthy within ${waited}s, so the agent was
+ NOT started -- a session against a dead proxy cannot work.
+ The logs above name the cause."
+  fi
+  ok "proxy healthy after ${waited}s"
+  local healthy_since_s="$SECONDS"
+
+  SESSION_ACTIVE=1
+  log "Starting OpenCode inside the Kata VM"
+  # -it lands the user INSIDE the agent. No runtime-override flag, ever (AD-6).
+  # The exit status is the agent's own; a non-zero exit is reported, not hidden.
+  local rc=0
+  compose run --rm -it --name "$SECUREAI_OPENCODE_CONTAINER" opencode || rc=$?
+
+  local session_end_s="$SECONDS"
+  # Story 4.4: the time-to-ready number, decomposed, and recorded against the
+  # PRD's 30s budget. A miss is a PRD conversation, never a code fix (NFR14),
+  # and it is recorded even when met, as a baseline. One host, one day -- a
+  # measurement, not a guarantee.
+  local proxy_s=$(( healthy_since_s - proxy_start_s ))
+  local total_s=$(( session_end_s - session_start_s ))
+  local budget_verdict="MET"
+  (( total_s > 30 )) && budget_verdict="NOT MET"
+  {
+    printf 'measured_on: %s\n' "$(date -Is)"
+    printf 'host: %s\n' "$(uname -srm)"
+    printf 'proxy_to_healthy_s: %s\n' "$proxy_s"
+    printf 'total_session_s: %s\n' "$total_s"
+    printf 'prd_budget_30s: %s\n' "$budget_verdict"
+    printf 'note: one host, one day. A miss is a PRD amendment, not a defect.\n'
+  } >"${SECUREAI_VAR}/last-session-timing.txt"
+  ok "session timing recorded at ${SECUREAI_VAR}/last-session-timing.txt"
+  printf '  Session timing: proxy-ready in %ss, total %ss, 30s budget %s\n' \
+    "$proxy_s" "$total_s" "$budget_verdict"
+
+  teardown_session
+  # Disarm the exit/signal traps so they don't re-run after a clean teardown.
+  trap - EXIT
+  trap - INT TERM HUP
+  if [[ "$rc" -ne 0 ]]; then
+    warn "OpenCode exited with status ${rc}."
+  fi
+  return "$rc"
+}
+
+cmd_down() {
+  need_docker
+  log "Stopping and removing any running SecureAI containers"
+  local removed=0
+  local name
+  for name in "$SECUREAI_OPENCODE_CONTAINER" "$SECUREAI_PROXY_CONTAINER"; do
+    if docker rm -f "$name" >/dev/null 2>&1; then
+      ok "removed ${name}"
+      removed=1
+    fi
+  done
+  # Works whether or not a session was ever started -- no obscure error when
+  # there is simply nothing to do (Story 4.3).
+  if [[ "$removed" -eq 0 ]]; then
+    ok "nothing was running"
+  fi
+  # The container cleanup already ran above; `compose down` only removes the
+  # network, so a config problem must never turn this into a failure.
+  if [[ -f "$SECUREAI_COMPOSE_ENV" ]]; then
+    compose down --remove-orphans >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_status() {
+  need_docker
+  log "SecureAI status"
+
+  # Story 1.4: assert the host's actual Docker version against the pairing in
+  # use, so an unsupported combination surfaces here rather than as a mystery
+  # Kata failure later.
+  local docker_version docker_key pairing_ok="unknown"
+  docker_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "unknown")"
+  if [[ "$docker_version" =~ ^([0-9]+)\.([0-9]+) ]]; then
+    docker_key=$(( 10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]} * 10 ))
+    if (( docker_key >= 2950 )); then
+      if grep -q '"time-namespaces"[[:space:]]*:[[:space:]]*false' /etc/docker/daemon.json 2>/dev/null; then
+        pairing_ok="yes -- workaround present (Kata needs it on Docker >= 29.5)"
+      else
+        pairing_ok="NO -- Docker >= 29.5 but features.time-namespaces is not false.
+        Kata will fail to start with 'invalid namespace type' (kata#13080).
+        Fix:  sudo install-fedora.sh"
+      fi
+    else
+      pairing_ok="yes -- no workaround needed below 29.5"
+    fi
+  fi
+  printf '    %-22s %s\n' "Docker" "${docker_version}"
+  printf '    %-22s %s\n' "Kata pairing" "${pairing_ok}"
+
+  local runtime_line
+  runtime_line="$(docker info --format '{{json .Runtimes}}' 2>/dev/null || echo "{}")"
+  printf '    %-22s %s\n' "kata registered" \
+    "$(grep -q '"kata"' <<<"$runtime_line" && echo yes || echo "NO")"
+  printf '    %-22s %s\n' "runc registered" \
+    "$(grep -q '"runc"' <<<"$runtime_line" && echo yes || echo "NO")"
+
+  local container
+  for container in "$SECUREAI_PROXY_CONTAINER" "$SECUREAI_OPENCODE_CONTAINER"; do
+    local state="not running"
+    if docker inspect "$container" >/dev/null 2>&1; then
+      state="$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || echo unknown)"
+      # Report the runtime the container is ACTUALLY under -- a declaration in
+      # compose is not an observation (Story 5.6).
+      local actual
+      actual="$(docker inspect --format '{{.HostConfig.Runtime}}' "$container" 2>/dev/null || echo unknown)"
+      state="${state} (runtime: ${actual})"
+    fi
+    printf '    %-22s %s\n' "$container" "$state"
+  done
+
+  printf '    %-22s %s\n' "config" "$SECUREAI_ETC"
+  printf '    %-22s %s\n' "runtime state" "$SECUREAI_VAR"
+  if [[ -f "$SECUREAI_CA" ]]; then
+    printf '    %-22s %s\n' "CA exported" "yes"
+  else
+    printf '    %-22s %s\n' "CA exported" "no -- run 'secureai ca export' before building"
+  fi
+}
+
+# =========================================================================
+# verify (AD-10, Story 5.1-5.7)
+# =========================================================================
+
+# Each gate prints PASS / FAIL / UNVERIFIED and, where relevant, the LIMIT of
+# what it proves. A gate that cannot run reports UNVERIFIED -- it never reports
+# PASS on the basis of a clean session start, because a clean start proves
+# nothing (AD-10).
+verify_result="PASS"
+verify_failures=0
+
+gate_pass() { printf '  \033[1;32mPASS\033[0m       %s\n' "$*"; }
+gate_fail() {
+  printf '  \033[1;31mFAIL\033[0m       %s\n' "$*"
+  printf '             cause: %s\n' "${2:-unknown}"
+  verify_failures=$(( verify_failures + 1 ))
+  verify_result="FAIL"
+}
+gate_unverified() {
+  printf '  \033[1;33mUNVERIFIED\033[0m %s\n' "$*"
+  printf '             cause: %s\n' "${2:-not checked on this host}"
+  # An UNVERIFIED gate must not erase a genuine FAILURE recorded earlier: the
+  # summary line should report the worst observed state, not the last one.
+  if [[ "${verify_result:-PASS}" != "FAIL" ]]; then
+    verify_result="UNVERIFIED"
+  fi
+}
+
+proxy_log() {
+  docker logs "$SECUREAI_PROXY_CONTAINER" 2>&1 || true
+}
+
+cmd_verify() {
+  need_docker
+  log "Verifying the isolation claims"
+  printf '\n  Each gate reports what it OBSERVED. A gate that cannot run is\n'
+  printf '  UNVERIFIED -- never PASS. A clean session start proves nothing.\n\n'
+
+  # A prerequisite for live gates (c), (d), and the kernel/direct-path probes.
+  # Gates (a) and (b) read the proxy log, which survives teardown, so they stay
+  # meaningful after a session ends.
+  local live=1
+  if ! docker inspect "$SECUREAI_PROXY_CONTAINER" >/dev/null 2>&1; then
+    live=0
+    printf '\n  The proxy container is not running, so the LIVE gates (c, d, kernel,\n'
+    printf '  direct-path) will report UNVERIFIED rather than claim a result.\n'
+    printf '  Gates (a) and (b) still read the preserved proxy log.\n\n'
+  fi
+
+  # --- gate (a): the proxy sees the API host ------------------------------
+  # Checked against the proxy's OWN log, not inferred from agent behaviour.
+  local log_text
+  log_text="$(proxy_log)"
+  [[ -n "$log_text" ]] || log_text="$(cat "${SECUREAI_VAR}/proxy.log" 2>/dev/null || true)"
+  if grep -qE 'api\.anthropic\.com' <<<"$log_text"; then
+    gate_pass "gate (a)  the proxy log shows the API host"
+  else
+    gate_fail "gate (a)  the proxy log shows the API host" \
+"no api.anthropic.com in the proxy log. Either the agent ignored HTTPS_PROXY,
+       or no model request has been made yet in this session."
+  fi
+
+  # --- gate (b): injection, as a fingerprint ------------------------------
+  if grep -qE 'authz=injected provider=[^ ]+ fp=[0-9a-f]{4}' <<<"$log_text"; then
+    local fp_line
+    fp_line="$(grep -oE 'authz=injected provider=[^ ]+ fp=[0-9a-f]{4}' <<<"$log_text" | tail -1)"
+    gate_pass "gate (b)  injection occurred: ${fp_line}"
+    printf '             this is a 4-char fingerprint, not key material.\n'
+  else
+    gate_fail "gate (b)  the real key was substituted" \
+"no 'authz=injected ... fp=' line. The placeholder reached the API unchanged,
+       which means no key is stored for that host -- check 'secureai keys list'."
+  fi
+
+  # --- gate (c): a non-allowlisted host fails THROUGH the proxy ------------
+  # Proves THE PROXY ENFORCES, because the client honours the proxy variables.
+  # It does NOT prove the guest cannot route around the proxy (AR26). That
+  # limit is stated explicitly below and probed separately in 5.5/5.7.
+  if [[ "$live" -eq 0 ]]; then
+    gate_unverified "gate (c)  a non-allowlisted host is refused with 403" \
+"requires a running proxy and guest; the session's containers are no longer up"
+  else
+    # Probe over HTTPS through the proxy. An http:// probe would be refused by
+    # the SCHEME gate, which would prove scheme gating only -- and gate (c) is
+    # about host allowlisting, so the two must not be conflated.
+    local probe="blocked-check.example"
+    local probe_out=""
+    # The proxy image is python:*-based, so it has python3+requests -- not
+    # necessarily curl. A probe that silently no-ops would be indistinguishable
+    # from a blocked host, so use the interpreter the image certainly ships.
+    probe_out="$(compose exec -T proxy \
+        python3 -c "
+import requests
+try:
+    r = requests.get('https://${probe}/',
+                     proxies={'http': 'http://127.0.0.1:${SECUREAI_PROXY_PORT}',
+                               'https': 'http://127.0.0.1:${SECUREAI_PROXY_PORT}'},
+                     verify=False, timeout=10)
+    print(r.status_code)
+except Exception:
+    print('')
+" 2>/dev/null || true)"
+    probe_out="$(printf '%s' "$probe_out" | tail -n1 | tr -d '\r')"
+    if [[ "$probe_out" == "403" ]]; then
+      gate_pass "gate (c)  a non-allowlisted host is refused with 403"
+      printf '             LIMIT: this proves THE PROXY ENFORCES (the client honours\n'
+      printf '             the proxy variables). It does NOT prove the guest cannot\n'
+      printf '             reach that host by another path. See the probes below.\n'
+    elif [[ -z "$probe_out" ]]; then
+      gate_unverified "gate (c)  a non-allowlisted host is refused" \
+"could not run the probe from inside the proxy container"
+    else
+      gate_fail "gate (c)  a non-allowlisted host is refused with 403" \
+"expected 403 from ${probe}, got '${probe_out}'"
+    fi
+  fi
+
+  # --- gate (d): the RUNTIME inside the guest, not curl (AD-10 risk #1) ---
+  # curl succeeding proves only curl. This runs the actual agent runtime. If
+  # Bun ignores NODE_EXTRA_CA_CERTS this is a FAILURE naming the failure
+  # family, and Story 2.5 is reopened rather than marked passing.
+  if [[ "$live" -eq 0 ]]; then
+    gate_unverified "gate (d)  HTTPS from the runtime inside the guest succeeds" \
+"requires a running guest container"
+  else
+    # Gate (d) is about the AGENT'S RUNTIME -- a Bun-compiled binary with its
+    # own CA bundle -- NOT about curl. Pointing this probe at curl would prove
+    # only that curl works, which is exactly what gate (d) exists to avoid
+    # mistaking for success. So the probe drives Node/Bun's fetch, which reads
+    # NODE_EXTRA_CA_CERTS, while curl is kept only as a contrasting signal.
+    local runtime_rc="" runtime_verdict="" curl_rc=""
+    runtime_rc="$(compose exec -T opencode \
+        sh -c 'command -v node >/dev/null 2>&1 && echo node-present || echo node-absent' \
+        2>/dev/null | tr -d '\r' || true)"
+    if [[ "$runtime_rc" == "node-present" ]]; then
+      runtime_verdict="$(compose exec -T opencode \
+          sh -c 'node -e "fetch(process.env.PROBE_URL||\"https://github.com\").then(r=>process.exit(r.status===200?0:2)).catch(()=>process.exit(1))"' \
+          2>/dev/null; echo "$?")" || true
+      runtime_verdict="$(printf '%s' "$runtime_verdict" | tail -n1 | tr -d '\r')"
+    fi
+    curl_rc="$(compose exec -T opencode \
+        sh -c 'curl -s -o /dev/null -w "%{http_code}" --max-time 15 https://github.com/' \
+        2>/dev/null | tr -d '\r' || true)"
+
+    if [[ "$runtime_rc" == "node-present" && "$runtime_verdict" == "0" ]]; then
+      gate_pass "gate (d)  HTTPS from the Node/Bun runtime inside the guest succeeds"
+      printf '             the runtime read NODE_EXTRA_CA_CERTS, so interception works.\n'
+      if [[ "$curl_rc" == "200" ]]; then
+        printf '             supporting signal: curl also reached the host.\n'
+      fi
+    elif [[ "$runtime_rc" != "node-present" ]]; then
+      gate_unverified "gate (d)  HTTPS from the runtime inside the guest succeeds" \
+"the guest image has no node runtime to probe; curl ('${curl_rc:-nothing}') proves only curl"
+      curl_rc=""
+    else
+      gate_fail "gate (d)  HTTPS from the runtime inside the guest succeeds" \
+"the Node/Bun fetch path failed (status '${runtime_verdict:-unknown}'; curl got '${curl_rc:-nothing}').
+       This is the Bun/Node CA failure family (bun#17325; opencode #3130/#4883/#3566/#923/#1694/#7073):
+       Story 2.5 is REOPENED, not passing."
+    fi
+    if [[ -n "$curl_rc" && "$curl_rc" != "200" ]]; then
+      printf '             contrasting signal: curl inside the guest returned %s.\n' "$curl_rc"
+    fi
+  fi
+
+  # --- Story 5.6: is the guest really in a VM with its own kernel? ---------
+  # Observed from the RUNNING container, not from compose or daemon.json,
+  # because those are declarations rather than observations.
+  if [[ "$live" -eq 0 ]]; then
+    gate_unverified "story 5.6  the guest runs under kata, on its own kernel" \
+"requires a running guest container"
+  else
+    local actual_runtime host_kernel guest_kernel
+    actual_runtime="$(docker inspect --format '{{.HostConfig.Runtime}}' \
+      "$SECUREAI_OPENCODE_CONTAINER" 2>/dev/null || echo unknown)"
+    if [[ "$actual_runtime" == "kata" ]]; then
+      host_kernel="$(uname -r)"
+      guest_kernel="$(compose exec -T opencode uname -r 2>/dev/null | tr -d '\r' || echo unknown)"
+      if [[ -n "$guest_kernel" && "$guest_kernel" != "$host_kernel" ]]; then
+      gate_pass "story 5.6  the guest runs under kata, on its own kernel"
+      printf '             host kernel:  %s\n' "$host_kernel"
+      printf '             guest kernel: %s\n' "$guest_kernel"
+    else
+      gate_unverified "story 5.6  a distinct guest kernel" \
+"guest kernel reads '${guest_kernel:-unknown}', host reads '${host_kernel}'.
+       If these match, the isolation premise of the whole system is invalid and
+       this must be escalated, not worked around."
+    fi
+  else
+    gate_fail "story 5.6  the guest runs under kata" \
+"the running container's runtime is '${actual_runtime}', not 'kata'.
+       Isolation is invalid; escalate rather than work around it."
+    fi
+  fi
+
+  # --- Story 5.5: the BLOCKING question -- does internal:true reach the tap? --
+  # Two DISTINCT questions, recorded separately:
+  #   5.5  what the bridge setting actually guarantees
+  #   5.7  whether the guest can reach the internet around the proxy
+  printf '\n'
+  log "The two open network questions (distinct, and both previously assumed)"
+
+  # 5.7 first, because it is the directly observable one.
+  if [[ "$live" -eq 0 ]]; then
+    gate_unverified "story 5.7  the guest CANNOT reach the internet around the proxy" \
+"requires a running guest container"
+  else
+    local direct_rc=""
+    direct_rc="$(compose exec -T opencode \
+        sh -c 'env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy \
+               curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://example.com/ 2>/dev/null || echo 000' \
+        2>/dev/null | tr -d '\r' || true)"
+    case "$direct_rc" in
+      000|"")
+        # An EMPTY or '000' result most often means the probe itself did not run
+        # (exec denied, DNS broken, no route) -- NOT that the guest was blocked.
+        # Recording it as "cannot reach the internet" would falsely retire
+        # AD-1's accepted risk, so an empty result is a failed observation.
+        gate_unverified "story 5.7  direct-path probe produced no result" \
+"the probe did not run or returned nothing; record after retrying on a live guest"
+        ;;
+      200|301|302)
+        gate_fail "story 5.7  the guest can reach the internet around the proxy" \
+"a direct request with no proxy variables SUCCEEDED (HTTP ${direct_rc}).
+       Enforcement is COOPERATIVE and this bypass path is REAL AND UNMITIGATED:
+       a guest process that ignores http_proxy/https_proxy reaches the internet
+       directly. The bypass path is named here deliberately rather than buried."
+        ;;
+      *)
+        gate_unverified "story 5.7  direct-path probe returned ${direct_rc}" \
+"the guest replied ${direct_rc} -- investigate before recording this as observed"
+        ;;
+    esac
+  fi
+
+  # 5.5 -- report the setting and state plainly that it is unverified here.
+  local internal_setting="not set"
+  grep -qE '^[[:space:]]*internal:' "$SECUREAI_COMPOSE_FILE" 2>/dev/null \
+    && internal_setting="$(grep -oE '^[[:space:]]*internal:.*' "$SECUREAI_COMPOSE_FILE" | head -1 | tr -d ' ')"
+  printf '\n'
+  printf '  story 5.5  bridge internal flag: %s\n' "$internal_setting"
+  printf '             This flag is NOT declared a guarantee. Whether it applies\n'
+  printf '             to the Kata tap device is the BLOCKING question of this\n'
+  printf '             design and is deliberately left unset rather than guessed:\n'
+  printf '             set it on and re-run verify to measure the effect.\n'
+
+  printf '\n'
+  log "Summary: ${verify_result} (${verify_failures} gate failure(s))"
+  printf '  Enforcement is COOPERATIVE. A clean session start, or curl failing,\n'
+  printf '  proves the PROXY enforces -- it does not prove the guest cannot route\n'
+  printf '  around it. The probes above record the real attack surface.\n'
+  # A failed OR an unverified run is a non-zero exit: scripting must not read
+  # "could not observe" as success.
+  if [[ "${verify_result}" == "PASS" && "${verify_failures}" -eq 0 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+cmd_help() {
+  cat <<EOF
+secureai -- OpenCode inside a Kata VM, behind a proxy that holds your keys.
+
+usage: secureai <command> [arguments]
+
+  opencode                 Start a session: proxy first, then the agent.
+                           You land INSIDE the agent; both containers are
+                           removed when you leave.
+  down                     Stop and remove any running containers.
+  status                   Show what is running, and the Docker/Kata pairing.
+  whitelist add <domain>   Allow an extra domain. Live: no restart needed.
+  whitelist list           Show the allowlist the proxy is actually reading.
+  keys set <host> <key>    Store a key. Never printed back.
+  keys list                Show hosts, values masked.
+  ca export                Produce the interception CA. Run this BEFORE
+                           building the guest image.
+  build                    Build both the proxy and the guest images, staging
+                           the exported CA so the guest can trust it.
+  verify                   Run the isolation gates and the open-question
+                           probes. Reports UNVERIFIED rather than guessing.
+  help                     This message.
+
+Configuration lives in ${SECUREAI_ETC} (0700) and is written only by this CLI.
+Runtime state, including the CA and the synced config the proxy reads, lives in
+${SECUREAI_VAR} (0700).
+EOF
+}
+
+# =========================================================================
+main() {
+  local command="${1:-help}"
+  shift || true
+  case "$command" in
+    opencode)         cmd_opencode "$@" ;;
+    down)             cmd_down "$@" ;;
+    status)           cmd_status "$@" ;;
+    whitelist)
+      local sub="${1:-list}"
+      case "$sub" in
+        add)  shift || true; cmd_whitelist_add "$@" ;;
+        list) cmd_whitelist_list ;;
+        *)    die "usage: secureai whitelist add|list" ;;
+      esac
+      ;;
+    keys)
+      local sub="${1:-list}"
+      case "$sub" in
+        set)  shift || true; cmd_keys_set "$@" ;;
+        list) cmd_keys_list ;;
+        *)    die "usage: secureai keys set|list" ;;
+      esac
+      ;;
+    ca)
+      local sub="${1:-export}"
+      case "$sub" in
+        export) cmd_ca_export ;;
+        *)      die "usage: secureai ca export" ;;
+      esac
+      ;;
+    verify)           cmd_verify ;;
+    build)            cmd_build "$@" ;;
+    help|-h|--help)   cmd_help ;;
+    *)                cmd_help; die "unknown command: ${command}" ;;
+  esac
+}
+
+main "$@"

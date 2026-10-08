@@ -1,0 +1,24 @@
+# SecureAI — the owned egress allowlist baseline (AD-15).
+#
+# This file IS the product's attack surface. It is the only policy source: the
+# proxy addon contains no default-allow and no host literal, so narrowing this
+# list is an edit to this file rather than a code change (Story 3.4).
+#
+#   * One host per line.
+#   * `*.example.com` matches subdomains, not the apex.
+#   * Mutate only with `secureai whitelist add`, which records an audit line.
+#     The proxy never accepts instructions; it re-reads this file per flow.
+#
+# NOTE ON QUOTING: entries are quoted because a bare `- *.example.com` is a
+# YAML *scanner error* (`*` starts an alias), which would make the addon fail
+# closed on every request.
+
+- "api.anthropic.com"
+- "github.com"
+- "*.githubusercontent.com"
+- "registry.npmjs.org"
+- "pypi.org"
+- "files.pythonhosted.org"
+- "models.dev"
+- "opencode.ai"
+- "astral.sh"

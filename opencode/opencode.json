@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "share": "disabled",
+  "shell": "/bin/sh",
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "https://api.anthropic.com"
+      }
+    }
+  }
+}

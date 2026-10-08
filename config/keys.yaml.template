@@ -1,0 +1,17 @@
+# SecureAI — keys template (onboarding).
+#
+# Installed as /etc/secureai/keys.yaml when no keys file exists yet. Every value
+# here is empty on purpose: this template teaches the shape without shipping a
+# credential, and an empty value is simply "no key configured", which the addon
+# treats as DENY rather than as an unauthenticated passthrough (AD-13).
+#
+# The real file is written 0640 root:root and is the sole source of truth.
+# The proxy mounts its runtime copy read-only and never writes config.
+#
+# Do not store keys here by hand once real keys exist -- use:
+#     secureai keys set <host> <key>
+# which writes the file 0640 and syncs it to /var/lib/secureai.
+#
+# `secureai keys list` always masks values, and no command reveals a raw key.
+
+"api.anthropic.com": ""
