@@ -216,27 +216,35 @@ write_daemon_json() {
   local raw_version version_key time_ns_flag
   raw_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "")"
   local kata_config_path=""
-  for candidate in \
-      /usr/share/kata-containers/configuration.toml \
-      /usr/share/defaults/kata-containers/vm.json \
-      /usr/share/kata-containers/configuration-qemu-pkg-forced.toml \
-      /usr/share/kata-containers/runtime-rs.json \
-      /opt/kata/configuration.toml \
-      /opt/kata/share/defaults/kata-containers/qemu/configuration.toml; do
-    if [[ -f "$candidate" ]]; then
-      kata_config_path="$candidate"
-      break
-    fi
-  done
+  # Ask the package database first: on F38/F43/F44 the toml lands at a
+  # different path depending on which kata-containers package variant shipped it
+  # (qemu Go runtime vs runtime-rs vs rust-shim defaults), and a stale
+  # hard-coded path is exactly the kind of assumption this installer exists to
+  # refuse. Fall back to known paths only if the rpm query yields nothing.
+  kata_config_path="$(rpm -ql kata-containers 2>/dev/null \
+      | grep -E 'configuration.*\.toml$' | head -1 || true)"
   if [[ -z "$kata_config_path" ]]; then
+    for candidate in \
+        /usr/share/kata-containers/configuration.toml \
+        /usr/share/defaults/kata-containers/qemu/configuration.toml \
+        /usr/share/defaults/kata-containers/configuration.toml \
+        /etc/kata-containers/configuration.toml \
+        /usr/libexec/kata-containers/configuration.toml \
+        /opt/kata/share/defaults/kata-containers/qemu/configuration.toml \
+        /opt/kata/configuration.toml; do
+      if [[ -f "$candidate" ]]; then
+        kata_config_path="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$kata_config_path" || ! -f "$kata_config_path" ]]; then
     die "Kata's runtime config was not found in any known location.
      After kata-containers is installed, locate it with:
        rpm -ql kata-containers | grep configuration
-     and re-run the installer, exporting SECUREAI_KATA_CONFIG_PATH explicitly:"
+     and re-run with:
+       SECUREAI_KATA_CONFIG_PATH=/your/discovery sudo bash install-fedora.sh"
   fi
-  # F43/F44 go-runtime packages put it at /usr/share/kata-containers/...; F38
-  # (Kata 3.0.1) ships it under /usr/share/defaults/. The check above searches
-  # both -- widen the candidate list before ever hard-coding.
   SECUREAI_KATA_CONFIG_PATH="${SECUREAI_KATA_CONFIG_PATH:-${kata_config_path}}"
   if version_key="$(docker_version_key "$raw_version")"; then
     if (( version_key >= SECUREAI_TIME_NS_MIN_KEY )); then
