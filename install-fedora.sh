@@ -127,7 +127,7 @@ check_preconditions() {
   #    curl because the payload may be fetched over HTTPS; python3 because
   #    daemon.json is merged with it (no jq dependency -- FR43 is bash only).
   local tool
-  for tool in dnf curl python3 install systemctl; do
+  for tool in dnf curl python3 install systemctl rpm; do
     command -v "$tool" >/dev/null 2>&1 \
       || die "'${tool}' is required by the installer but is not installed."
   done
@@ -139,15 +139,43 @@ check_preconditions() {
 # =========================================================================
 install_packages() {
   log "Installing Kata Containers and Docker Engine"
-  # runtime-rs is default upstream from Kata 4.0.0, but the Fedora package
-  # ships the Go runtime.
-  dnf -y install kata-containers docker policycoreutils policycoreutils-python-utils \
-    dbus dbus-daemon \
-    || die "Package installation failed. Check that this Fedora release still
-     carries kata-containers, docker, and the related policycoreutils.
-     If the failure is on `kata-containers`'s post-install script, the missing
-     tool is almost certainly dracut's dbus module, which is what the new
-     dbus/dbus-daemon prerequisite on the same line provides."
+  # Capability-first, version-agnostic (Stories 1.1-1.2): install only what is
+  # actually missing, so a re-run -- or a host that already runs Docker CE --
+  # never turns a working host into a fatal dependency error. A bare `docker`
+  # package name resolves to Fedora's moby-engine, which CONFLICTS with an
+  # installed docker-ce-cli; asking for it unconditionally breaks every
+  # Docker-CE host even though its engine is fine. No per-release package
+  # names appear here, so the same logic runs on F38, F43, F44, and later.
+  local missing=()
+  # Docker engine: presence means the `docker` binary answers, whichever
+  # flavour (moby or CE) provides it. A present-but-stopped daemon is started
+  # below by `systemctl enable --now docker`, not reinstalled here.
+  if command -v docker >/dev/null 2>&1; then
+    ok "docker engine already present"
+  else
+    missing+=("docker")
+  fi
+  # Kata, SELinux tooling, dbus: presence means the rpm is installed.
+  local pkg
+  for pkg in kata-containers policycoreutils policycoreutils-python-utils dbus dbus-daemon; do
+    if rpm -q "$pkg" >/dev/null 2>&1; then
+      ok "${pkg} already present"
+    else
+      missing+=("$pkg")
+    fi
+  done
+  if ((${#missing[@]} > 0)); then
+    dnf -y install "${missing[@]}" \
+      || die "Package installation failed for: ${missing[*]}.
+       If 'docker' is among them on a host that already runs Docker CE, the
+       bare name resolves to Fedora's moby-engine, which conflicts with
+       docker-ce-cli -- provide the engine from your existing repo instead.
+       If the failure is in the kata-containers post-install script, the
+       missing tool is almost certainly dracut's dbus module, provided by
+       the dbus/dbus-daemon prerequisites on the same install line."
+  else
+    ok "required packages already present"
+  fi
 
   # Compose v2 is the ONLY hard input to the session lifecycle, so its
   # package name is resolved rather than assumed: F38's own repos ship it as

@@ -150,6 +150,129 @@ class TestInstallerPreconditions(unittest.TestCase):
         body = function_body(INSTALLER, "install_packages")
         self.assertIn("systemctl enable --now docker", body)
 
+    def test_installer_code_contains_no_backtick_substitution(self):
+        """A `...` inside double quotes runs as a command, not as a quote.
+
+        The package-failure message once read `kata-containers` in backticks,
+        so every installer failure ALSO printed `kata-containers: command not
+        found` on the die line, misdirecting the diagnosis at the exact
+        moment a readable error mattered most. Backticks survive only in
+        comments and quoted heredocs, where the shell never expands them.
+        """
+        lines = read(INSTALLER).splitlines()
+        delimiter = None
+        for n, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if delimiter is not None:
+                if stripped == delimiter:
+                    delimiter = None
+                continue
+            match = re.search(r"<<'(\w+)'", line)
+            if match:
+                delimiter = match.group(1)
+                continue
+            if not stripped or stripped.startswith("#"):
+                continue
+            self.assertNotIn(
+                "`", line,
+                "backtick on line %d runs as command substitution" % n,
+            )
+
+
+class TestInstallPackagesCapabilityFirst(unittest.TestCase):
+    """The package phase installs only what is missing, on any Fedora.
+
+    A bare `docker` package name resolves to moby-engine, which conflicts
+    with docker-ce-cli -- so an unconditional `dnf -y install ... docker`
+    fatally breaks every working Docker-CE host (observed on F38: the
+    installer died although Kata, Docker, and Compose all ran). These run
+    the real `install_packages` with stubbed docker/rpm/dnf/systemctl.
+    """
+
+    def _run(self, present_pkgs, docker_present=True, dnf_fails=False):
+        stub_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            stub_dir, ignore_errors=True))
+        present_file = os.path.join(stub_dir, "present")
+        with open(present_file, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(present_pkgs) + "\n")
+        record = os.path.join(stub_dir, "dnf-args")
+        helpers = {
+            "docker": "#!/bin/bash\nexit 0\n",
+            "rpm": ("#!/bin/bash\n"
+                    '[ "$1" = "-q" ] || exit 1\n'
+                    '/usr/bin/grep -qx "$2" "$STUB_PRESENT"\n'),
+            "dnf": ("#!/bin/bash\n"
+                    "printf '%s\\n' \"$@\" >> \"$STUB_DNF_RECORD\"\n"
+                    'for arg in "$@"; do\n'
+                    '  if [ "$arg" = "docker" ]; then\n'
+                    "    printf '#!/bin/bash\\nexit 0\\n' > \"$STUB_DIR/docker\"\n"
+                    "    /usr/bin/chmod 755 \"$STUB_DIR/docker\"\n"
+                    "  fi\n"
+                    "done\n"
+                    + ("exit 1\n" if dnf_fails else "exit 0\n")),
+            "systemctl": "#!/bin/bash\nexit 0\n",
+        }
+        for name, content in helpers.items():
+            if name == "docker" and not docker_present:
+                continue
+            path = os.path.join(stub_dir, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            os.chmod(path, 0o755)
+        script = "\n".join([
+            "set -euo pipefail",
+            'log()  { printf "log: %s\\n" "$*"; }',
+            'ok()   { printf "ok: %s\\n" "$*"; }',
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            function_body(INSTALLER, "install_packages") + "\n}",
+            "install_packages",
+        ])
+        env = {"PATH": stub_dir, "STUB_PRESENT": present_file,
+               "STUB_DNF_RECORD": record, "STUB_DIR": stub_dir}
+        return subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                              text=True, timeout=60, env=env), record
+
+    ALL_PKGS = ["kata-containers", "policycoreutils",
+                "policycoreutils-python-utils", "dbus", "dbus-daemon"]
+
+    def _recorded(self, record):
+        if not os.path.exists(record):
+            return []
+        with open(record, encoding="utf-8") as fh:
+            return [l.strip() for l in fh.read().splitlines() if l.strip()]
+
+    def test_all_present_installs_nothing(self):
+        result, record = self._run(self.ALL_PKGS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for pkg in self.ALL_PKGS + ["docker"]:
+            self.assertNotIn(pkg, self._recorded(record),
+                             "%s is present and must not be reinstalled" % pkg)
+        self.assertIn("already present", result.stdout)
+
+    def test_only_missing_packages_are_requested(self):
+        present = [p for p in self.ALL_PKGS if p != "kata-containers"]
+        result, record = self._run(present)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recorded = self._recorded(record)
+        self.assertIn("kata-containers", recorded)
+        for pkg in present + ["docker"]:
+            self.assertNotIn(pkg, recorded,
+                             "%s is present and must not be reinstalled" % pkg)
+
+    def test_absent_docker_engine_names_the_docker_package(self):
+        result, record = self._run(self.ALL_PKGS, docker_present=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("docker", self._recorded(record))
+
+    def test_failure_names_packages_without_spurious_command_errors(self):
+        result, _ = self._run([], dnf_fails=True)
+        self.assertNotEqual(result.returncode, 0)
+        output = result.stdout + result.stderr
+        self.assertIn("kata-containers", output)
+        self.assertNotIn("command not found", output)
+
 
 class TestInstallerRuntimeWiring(unittest.TestCase):
     """Matrix row 13 -- the version matrix. Structural (needs root to run)."""
