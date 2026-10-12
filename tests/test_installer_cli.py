@@ -394,16 +394,22 @@ class TestInstallerRuntimeWiring(unittest.TestCase):
         real heredoc runs against a fixture daemon.json here.
         """
         source = read(INSTALLER)
-        start = source.index("<<'PY'")
-        lines = source[start:].splitlines()[1:]
-        python_lines = []
-        for line in lines:
-            if line == "PY":
-                break
-            python_lines.append(line)
-        else:
-            self.fail("merge heredoc terminator PY not found")
-        python_src = "\n".join(python_lines)
+        # Two python heredocs exist (variant derivation, daemon merge); the
+        # merge is the one taking four argv entries (target, flag, config,
+        # shim), so select by arity rather than position.
+        blocks = []
+        rest = source
+        while "<<'PY'" in rest:
+            _, _, rest = rest.partition("<<'PY'")
+            lines = rest.splitlines()[1:]
+            block_lines = []
+            for line in lines:
+                if line == "PY":
+                    break
+                block_lines.append(line)
+            blocks.append("\n".join(block_lines))
+            rest = "\n".join(lines[len(block_lines) + 1:])
+        python_src = next(b for b in blocks if "sys.argv[4]" in b)
         self.assertIn('"runtimeType": kata_shim', python_src)
         with tempfile.TemporaryDirectory() as tmp:
             target = os.path.join(tmp, "daemon.json")

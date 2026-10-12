@@ -2,24 +2,29 @@
 
 - source_spec: `architecture/secureai-kata-opencode/spec-continue-sprint-from-status.md`
   summary: >-
-    Guest sessions cannot complete on Fedora 38 (kata 3.0.2 Go): with runtime
-    resolution fixed, a Docker-managed bridge veth fails inside the sandbox
-    with `conflicts with existing route`, while `--network none` boots a QEMU
-    Q35 guest in ~3s. Guest end-to-end (stories 1-7 boot leg, Epic 5 live
-    gates) needs a Fedora 43/44 host (kata 3.25/3.26) to confirm the Go
+    Guest sessions cannot complete on Fedora 38 (kata 3.0.2 Go) with any
+    Docker-managed network. Guest end-to-end (stories 1-7 boot leg, Epic 5
+    live gates) needs a Fedora 43/44 host (kata 3.25/3.26) to confirm the Go
     tcfilter path works there against Docker-managed bridges.
   evidence: >-
-    `docker run --rm --runtime kata` on docker0 AND on secureai_net
-    (10.211.0.0/24) both fail programming the veth IP against the
-    pre-existing bridge-subnet route; `--network none` and `ctr run
-    --runtime io.containerd.kata.v2` both boot. Runtime wiring itself is
-    settled: daemon.json carries `runtimeType` as the absolute rpm-derived
-    Go-shim path (class-form is PATH-hijackable, `path`-form is OCI-mapped
-    by Docker onto kata-runtime which lost its verbs in 2.x, and
-    `path`+`runtimeType` bricks dockerd -- each observed live, see
-    install-fedora.sh write_daemon_json). The pre-17:11 daemon.json that
-    booted one session was overwritten without a backup before this was
-    understood; the installer now keeps daemon.json.secureai-bak.
+    Exhausted live, each form run separately: class-form resolves via PATH
+    (a /usr/local/bin runtime-rs shim hijacked the boot); `path`-form is
+    OCI-mapped by Docker onto kata-runtime, which lost its verbs in 2.x;
+    `path`+`runtimeType` bricks dockerd; `runtimeType` as the absolute
+    rpm-derived Go-shim path boots deterministically. With wiring settled,
+    every Docker-managed bridge (docker0 and secureai_net) fails programming
+    the veth (`conflicts with existing route`, kata 3.0.2 tcfilter not
+    idempotent vs libnetwork); disable_new_netns+none fails the same way in
+    the host netns; host-network mode boots with loopback only; macvtap is
+    impossible on this WiFi-only uplink. `--network none` and `ctr run
+    --runtime io.containerd.kata.v2` both boot a QEMU Q35 guest, so
+    hypervisor, assets, and config are proven good. A Fedora-38
+    version-conditional config variant was built, proven live to warn,
+    derive, and wire correctly -- then removed again with its tests when the
+    remedy itself failed (kept in history, not in the tree). The pre-17:11
+    daemon.json that booted one session was overwritten without a backup
+    before this was understood; the installer now keeps
+    daemon.json.secureai-bak.
 
 - source_spec: `architecture/secureai-kata-opencode/spec-fix-proxy-vanishes-on-startup.md`
   summary: The generate-path die in `cmd_ca_export` names the wrong image.
