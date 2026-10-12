@@ -339,24 +339,99 @@ class TestInstallerRuntimeWiring(unittest.TestCase):
         # And the installer must refuse to continue if one ever appears.
         self.assertIn('if grep -q \'"default-runtime"\'', source)
 
-    def test_kata_runtime_uses_the_containerd_runtime_class_not_the_shim_binary(self):
+    def test_kata_runtime_uses_an_absolute_shim_path_not_the_class(self):
         source = read(INSTALLER)
-        # Docker accepts a shim v2 runtime as the containerd RUNTIME CLASS
-        # `io.containerd.<name>.v2` (which it resolves to the
-        # containerd-shim-<name>-v2 binary) or as a full path. The bare shim
-        # binary name is rejected at container start:
+        # The runtimeType carries the absolute Go-shim path, not the
+        # containerd class: class-form resolves the binary via PATH and is
+        # hijackable, `path`-form is OCI-mapped by Docker onto kata-runtime
+        # (which lost its OCI verbs in 2.x), and `path` + `runtimeType`
+        # together are rejected by dockerd. The class literal survives only
+        # in comments explaining why it is not written.
+        # The bare shim binary NAME is still rejected (that never worked):
         #   failed to resolve runtime path: invalid runtime name
         #   containerd-shim-kata-v2, correct runtime name should be either
         #   format like `io.containerd.runc.v2` or a full path to the binary
-        self.assertIn('"runtimeType": "io.containerd.kata.v2"', source)
+        self.assertIn('"runtimeType": kata_shim', source)
         self.assertNotIn('"runtimeType": "containerd-shim-kata-v2"', source)
-        # And the installer must assert the class form after writing it, and
-        # observe what Docker actually loaded.
+        self.assertNotIn('"runtimeType": "io.containerd.kata.v2"', source)
+        # And the installer must assert the pin after writing it, must refuse
+        # a `path` key (bricks the daemon), and must observe what Docker
+        # actually loaded.
         self.assertIn("""grep -q '"runtimeType"[[:space:]]""", source)
+        self.assertIn("containerd-shim-kata-v2", source)
+        self.assertIn("secureai-bak", source)
         self.assertIn("docker info --format", source)
         # `kata-qemu` is a NAME, never an executable to invoke.
         self.assertNotIn("/usr/bin/kata-qemu", source)
         self.assertNotIn("/usr/libexec/kata-qemu", source)
+
+    def test_kata_shim_binary_is_pinned_from_the_package_db(self):
+        """The shim path is absolute, rpm-derived, and lives in runtimeType.
+
+        Observed on F38: class-form resolves via PATH (a /usr/local/bin
+        runtime-rs shim hijacked the boot), `path`-form is OCI-mapped by
+        Docker onto kata-runtime (no OCI verbs since 2.x), and
+        `path` + `runtimeType` together brick dockerd. The merge must
+        therefore write the rpm-derived absolute path AS the runtimeType
+        with no `path` key -- derived from `rpm -ql kata-containers`,
+        never per-release -- and assert it after writing.
+        """
+        body = function_body(INSTALLER, "write_daemon_json")
+        self.assertIn("kata_shim_path", body)
+        self.assertIn("rpm -ql kata-containers", body)
+        self.assertIn("containerd-shim-kata-v2$", body)
+        self.assertIn('"runtimeType": kata_shim', body)
+        self.assertNotIn('"path": kata_shim', body)
+        # The backup lives past the merge block (after function_body's first
+        # lone-brace cut), so it is asserted against the whole file.
+        self.assertIn("secureai-bak", read(INSTALLER))
+
+    def test_daemon_json_merge_pins_shim_and_keeps_shape(self):
+        """EXECUTES the merge heredoc: pins, ConfigPath, no default-runtime.
+
+        A source-text check cannot prove the written JSON carries the pin
+        while preserving unrelated keys and dropping default-runtime, so the
+        real heredoc runs against a fixture daemon.json here.
+        """
+        source = read(INSTALLER)
+        start = source.index("<<'PY'")
+        lines = source[start:].splitlines()[1:]
+        python_lines = []
+        for line in lines:
+            if line == "PY":
+                break
+            python_lines.append(line)
+        else:
+            self.fail("merge heredoc terminator PY not found")
+        python_src = "\n".join(python_lines)
+        self.assertIn('"runtimeType": kata_shim', python_src)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "daemon.json")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write('{"default-runtime": "runc", "debug": true,'
+                         ' "runtimes": {"other": {"path": "/x"}}}')
+            script = os.path.join(tmp, "merge.py")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(python_src)
+            result = subprocess.run(
+                ["python3", script, target, "false",
+                 "/cfg/configuration.toml", "/usr/bin/containerd-shim-kata-v2"],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            import json as _json
+            with open(target, encoding="utf-8") as fh:
+                merged = _json.load(fh)
+        kata = merged["runtimes"]["kata"]
+        self.assertEqual(kata["runtimeType"], "/usr/bin/containerd-shim-kata-v2")
+        self.assertEqual(kata["options"]["ConfigPath"], "/cfg/configuration.toml")
+        self.assertNotIn("path", kata,
+                         "a path key beside runtimeType bricks dockerd")
+        self.assertNotIn("default-runtime", merged)
+        self.assertTrue(merged["debug"])
+        # `runtimes` is replaced wholesale (only kata survives): the merge
+        # owns that key so a stale second writer cannot linger in it.
+        self.assertEqual(list(merged["runtimes"]), ["kata"])
 
 
 class TestKataRuntimeTypeGate(unittest.TestCase):

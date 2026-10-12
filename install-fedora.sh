@@ -383,6 +383,32 @@ write_daemon_json() {
        SECUREAI_KATA_CONFIG_PATH=/your/discovery sudo bash install-fedora.sh"
   fi
   SECUREAI_KATA_CONFIG_PATH="${SECUREAI_KATA_CONFIG_PATH:-${kata_config_path}}"
+  # The shim binary Docker must exec, resolved from the package database
+  # rather than the runtime class. Class-form (`runtimeType` as
+  # `io.containerd.kata.v2`) resolves the binary Docker-side by convention
+  # and demonstrably lands on `kata-runtime` -- which lost its OCI verbs
+  # (`create`, `features`) when Kata dropped the CLI in 2.x, so every guest
+  # dies before booting. It is ALSO PATH-dependent: a same-named shim
+  # earlier on PATH (observed: a /usr/local/bin runtime-rs install) hijacks
+  # the boot with 'Runtime name is missing in the configuration'. An
+  # absolute path in `runtimeType` is Docker-valid ("a full path to the
+  # binary"), deterministic, and hijack-proof. (`path` + `runtimeType`
+  # together are rejected by dockerd, so the pin lives in `runtimeType`.)
+  # No per-release paths: the rpm query works wherever the Fedora package
+  # ships the Go shim.
+  local kata_shim_path=""
+  kata_shim_path="$(rpm -ql kata-containers 2>/dev/null \
+      | grep -E 'containerd-shim-kata-v2$' | head -1 || true)"
+  if [[ -z "$kata_shim_path" ]]; then
+    kata_shim_path="/usr/bin/containerd-shim-kata-v2"
+  fi
+  if [[ ! -x "$kata_shim_path" ]]; then
+    die "Kata's Go shim is missing or not executable at ${kata_shim_path}.
+     Docker must exec exactly this binary: a same-named shim earlier on PATH
+     (e.g. a /usr/local/bin runtime-rs install) fails on the Fedora config.
+     After kata-containers is installed, locate it with:
+       rpm -ql kata-containers | grep containerd-shim-kata-v2"
+  fi
   if version_key="$(docker_version_key "$raw_version")"; then
     if (( version_key >= SECUREAI_TIME_NS_MIN_KEY )); then
       time_ns_flag="true"
@@ -409,10 +435,10 @@ write_daemon_json() {
   else
     printf '{}\n' >"$tmp"
   fi
-  python3 - "$tmp" "$time_ns_flag" "${SECUREAI_KATA_CONFIG_PATH}" <<'PY'
+  python3 - "$tmp" "$time_ns_flag" "${SECUREAI_KATA_CONFIG_PATH}" "${kata_shim_path}" <<'PY'
 import json, os, sys
 
-path, time_ns_flag, kata_config = sys.argv[1], sys.argv[2], sys.argv[3]
+path, time_ns_flag, kata_config, kata_shim = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(path, "r", encoding="utf-8") as fh:
     try:
         cfg = json.load(fh)
@@ -423,18 +449,24 @@ if not isinstance(cfg, dict):
 
 # The one runtime we register.
 #
-# `runtimeType` must be the containerd RUNTIME CLASS, not the shim binary.
-# Docker resolves a shim-v2 class `io.containerd.<name>.v2` to the binary
-# `containerd-shim-<name>-v2`, so the class below resolves to
-# containerd-shim-kata-v2. Passing the binary name directly fails at session
-# start with:
-#   failed to resolve runtime path: invalid runtime name containerd-shim-kata-v2,
-#   correct runtime name should be either format like `io.containerd.runc.v2`
-#   or a full path to the binary
+# `runtimeType` is the absolute path of the Fedora Go shim. Reason, from
+# observation on this host (each form was run, not reasoned about):
+# - Class-form (`io.containerd.kata.v2`) resolves the shim binary via
+#   containerd's PATH, so a same-named shim earlier on PATH (observed: a
+#   /usr/local/bin runtime-rs install) hijacks the boot and dies on this
+#   Go-format config with 'Runtime name is missing in the configuration'.
+# - `path`-form (any key) is OCI-mapped by Docker: dockerd execs the path
+#   binary itself with OCI verbs (`features`, then `create`). kata-runtime
+#   lost those verbs when Kata dropped the CLI in 2.x, so that form dies
+#   with 'Invalid command "create"' before any VM exists.
+# - `path` + `runtimeType` together are rejected by dockerd outright
+#   ('cannot configure both'), so the pin lives in `runtimeType` alone:
+#   a full path there is Docker-valid and resolves to exactly one binary
+#   with no PATH search and no hijack surface.
 # `kata-qemu` is likewise a NAME (hypervisor config basename), never a path.
 cfg["runtimes"] = {
     "kata": {
-        "runtimeType": "io.containerd.kata.v2",
+        "runtimeType": kata_shim,
         "options": {"ConfigPath": kata_config},
     }
 }
@@ -459,6 +491,9 @@ with open(path, "w", encoding="utf-8") as fh:
 PY
   install -m 0644 "$tmp" "$SECUREAI_DAEMON_JSON"
   rm -f "$tmp"
+  # Keep one rotating backup: a rewrite replaces `runtimes` wholesale, and a
+  # working hand-made wiring overwritten without a copy is unrecoverable.
+  cp -f "$SECUREAI_DAEMON_JSON" "${SECUREAI_DAEMON_JSON}.secureai-bak" 2>/dev/null || true
 
   # Assert what we wrote rather than trusting the write.
   grep -q '"kata"' "$SECUREAI_DAEMON_JSON" || die "daemon.json has no kata runtime after writing it."
@@ -466,14 +501,19 @@ PY
     die "daemon.json contains default-runtime. This would move the key-holding
      proxy into the Kata VM and destroy the trust boundary. Refusing to continue."
   fi
-  # The runtime class form is what Docker accepts for a shim v2 runtime; the
-  # bare shim binary name is rejected at container start, long after the
-  # installer would have called itself done.
-  grep -q '"runtimeType"[[:space:]]*:[[:space:]]*"io.containerd.kata.v2"' \
+  # The runtimeType must be the absolute shim path (see merge comment), and a
+  # `path` key must be ABSENT: dockerd rejects `path` + `runtimeType` together
+  # and then refuses to start at all.
+  grep -q '"runtimeType"[[:space:]]*:[[:space:]]*".*containerd-shim-kata-v2"' \
     "$SECUREAI_DAEMON_JSON" \
-    || die "daemon.json does not declare runtimeType io.containerd.kata.v2.
-     Docker resolves that class to the containerd-shim-kata-v2 binary; passing
-     the binary name itself is rejected as an invalid runtime name."
+    || die "daemon.json does not pin the kata shim binary in runtimeType.
+     Class-form resolves via PATH and is hijackable; a same-named shim
+     earlier on PATH (a /usr/local/bin runtime-rs install was observed here)
+     takes the boot and fails on the Fedora config."
+  if grep -q '"path"[[:space:]]*:' "$SECUREAI_DAEMON_JSON"; then
+    die "daemon.json contains a runtime path key alongside runtimeType.
+     dockerd rejects that combination and will not start."
+  fi
   ok "kata runtime registered, default-runtime absent"
 
   # Restart so the new configuration is actually loaded. Skipping this is why an
