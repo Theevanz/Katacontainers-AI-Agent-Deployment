@@ -127,10 +127,22 @@ ENV OPENCODE_CONFIG=/home/node/.config/opencode/opencode.json \
 # Provider SDKs opencode would otherwise install AT RUNTIME into
 # ~/.cache/opencode/bin are pre-seeded here, so a runtime-discovered dependency
 # fails the build instead of silently widening the allowlist (AD-8).
+# The set comes from the vendored catalog's npm fields -- the same file the
+# runtime reads -- so the build and the runtime cannot disagree on what is
+# needed. An empty set is a build failure naming the SDKs, not a
+# runtime-discovering image (Story 1.7).
 # The proxy variables are injected by compose from compose.env -- NEVER baked
 # here, so the address stays one constant (AD-5, AD-11).
 RUN set -eux; \
+    [ "$(id -u node)" = "1000" ] || { echo "FATAL: user 'node' UID is $(id -u node), expected 1000 (AD-9). Refusing to build." >&2; exit 1; }; \
+    case "${OPENCODE_VERSION:-}" in *-musl*) echo "FATAL: refusing -musl variant '${OPENCODE_VERSION:-unknown}' on glibc bookworm (AD-9). Use the glibc package, never -musl." >&2; exit 1;; esac; \
+    SDK_SET="$(jq -r '.. | .npm? // empty' /opt/opencode-catalog/models.json | grep '^@ai-sdk/' | sort -u | tr '\n' ' ')"; \
+    if [ -z "$(printf '%s' "$SDK_SET" | tr -d '[:space:]')" ]; then echo "FATAL: no @ai-sdk/* provider SDKs found in /opt/opencode-catalog/models.json npm fields. Refusing to build a runtime-discovering image (AD-8, Story 1.7)." >&2; exit 1; fi; \
+    echo "Pre-seeding provider SDKs: ${SDK_SET}"; \
     mkdir -p /home/node/.cache/opencode/bin; \
+    npm install --no-audit --no-fund --prefix /home/node/.cache/opencode/bin ${SDK_SET}; \
+    test -d /home/node/.cache/opencode/bin/node_modules; \
+    test -n "$(ls -A /home/node/.cache/opencode/bin/node_modules)"; \
     chown -R node:node /home/node/.cache /home/node/.config /home/node/.local
 
 USER node

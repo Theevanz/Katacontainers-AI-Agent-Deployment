@@ -58,9 +58,19 @@ services:
         # by Compose service DNS, which does not exist inside the VM (AD-5).
         ipv4_address: ${SECUREAI_PROXY_IP}
     healthcheck:
-      # Exercises the proxy, not merely that the process is alive: a plain
-      # process check would report healthy before mitmproxy can serve (Story 2.6).
-      # Sending a real request through the proxy proves it answers on its port.
+      # Exercises the proxy AND its policy, not merely that the process is
+      # alive: a plain process check would report healthy before mitmproxy can
+      # serve (Story 2.6), and a raw-socket-only check would report healthy
+      # before keys are loaded in-process. The socket proves the proxy answers
+      # on its port; the addon check proves policy loads in-process
+      # (whitelist readable, keys in-process) via the same code the proxy
+      # serves with. Until both pass, health stays unhealthy so a first
+      # request cannot race key loading.
+      # The CLI's own poll loop in cmd_opencode is the ENFORCING gate when the
+      # guest is started with --no-deps (which skips depends_on): it waits for
+      # this health status before attaching. Keep service_healthy below as the
+      # declarative backup -- removing the CLI wait because depends_on exists,
+      # or removing depends_on because the CLI waits, reintroduces the race.
       test:
         - CMD
         - python3
@@ -70,7 +80,10 @@ services:
           s=socket.create_connection(("127.0.0.1", ${SECUREAI_PROXY_PORT}), 3);
           s.sendall(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
           d=s.recv(64); s.close();
-          sys.exit(0 if d else 1)
+          sys.exit(1) if not d else None;
+          sys.path.insert(0, "/opt/secureai");
+          import addon;
+          sys.exit(0 if addon.SecureAIAddon().is_healthy() else 1)
       interval: 2s
       timeout: 5s
       # Bounded so a proxy that never becomes healthy surfaces a readable
@@ -94,7 +107,13 @@ services:
     depends_on:
       proxy:
         # The agent must not start until the proxy can actually serve, so the
-        # first request cannot race proxy boot (Story 2.6).
+        # first request cannot race proxy boot (Story 2.6). This is the
+        # DECLARATIVE backup: when the CLI starts the guest with --no-deps
+        # (proxy already up under the same name), compose SKIPS this gate and
+        # the CLI's own poll loop in cmd_opencode is the ENFORCING gate that
+        # waits for the health status above. Keep both -- removing the CLI
+        # wait because this exists, or this because the CLI waits,
+        # reintroduces the race.
         condition: service_healthy
     environment:
       # Placeholder only. The real key is substituted by the proxy on the way

@@ -1070,5 +1070,390 @@ class TestProxyDeathVisibility(unittest.TestCase):
                       "appends race the truncated file")
 
 
+
+class TestWhitelistList(unittest.TestCase):
+    """Story 3-6: `whitelist list` prints what the proxy actually reads.
+
+    EXECUTED against the real function with fixture dirs, because the
+    properties that matter -- dying on missing, warning on empty, and
+    preferring the runtime copy -- are invisible to source matching.
+    """
+
+    def _run(self, etc_files=None, var_files=None):
+        import tempfile as _tf
+        tmp = _tf.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        etc_dir = tmp + "/etc"
+        var_dir = tmp + "/var"
+        os.makedirs(etc_dir, exist_ok=True)
+        os.makedirs(var_dir, exist_ok=True)
+        for name, content in (etc_files or {}).items():
+            with open(os.path.join(etc_dir, name), "w", encoding="utf-8") as fh:
+                fh.write(content)
+        for name, content in (var_files or {}).items():
+            with open(os.path.join(var_dir, name), "w", encoding="utf-8") as fh:
+                fh.write(content)
+        body_yaml = function_body(CLI, "yaml_list") + "\n}"
+        body_list = function_body(CLI, "cmd_whitelist_list") + "\n}"
+        helpers = "\n".join([
+            'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            'ok()   { printf "ok: %s\\n" "$*"; }',
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'log()  { printf "==> %s\\n" "$*"; }',
+            'cmd_init_config() { return 0; }',
+        ])
+        script = "\n".join([helpers, body_yaml, body_list, 'cmd_whitelist_list'])
+        env = {**os.environ, "SECUREAI_ETC": etc_dir, "SECUREAI_VAR": var_dir}
+        return subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, timeout=30, env=env)
+
+    def test_missing_allowlist_dies_naming_whitelist_add(self):
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0,
+                            "missing allowlist must exit non-zero")
+        self.assertIn("whitelist add", result.stderr + result.stdout)
+
+    def test_empty_allowlist_warns_that_every_host_is_blocked(self):
+        result = self._run(var_files={"whitelist.yaml": "# nothing here\n"})
+        self.assertEqual(result.returncode, 0,
+                         "empty allowlist warns, it does not die: %s" % result.stderr)
+        out = result.stdout + result.stderr
+        self.assertIn("every host", out)
+        self.assertIn("blocked", out)
+
+    def test_prefers_the_runtime_copy_and_prints_its_source(self):
+        result = self._run(
+            etc_files={"whitelist.yaml": '- "etc-only.example"\n'},
+            var_files={"whitelist.yaml": '- "var-only.example"\n'},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = result.stdout + result.stderr
+        self.assertIn("var-only.example", out,
+                      "the listing must reflect the synced copy the proxy reads")
+        self.assertNotIn("etc-only.example", out,
+                         "the stale /etc copy must not be listed when a runtime copy exists")
+        self.assertIn("var", out, "the runtime source path must be printed")
+
+    def test_lists_the_etc_copy_when_no_runtime_copy_exists(self):
+        result = self._run(etc_files={"whitelist.yaml": '- "etc-only.example"\n'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("etc-only.example", result.stdout + result.stderr)
+
+    def test_whitelist_list_is_structurally_synced_and_audited(self):
+        body = function_body(CLI, "cmd_whitelist_list")
+        self.assertIn("SECUREAI_VAR", body, "must prefer the runtime copy")
+        self.assertIn("whitelist add", body, "missing case must name the fix")
+
+
+class TestSessionTiming(unittest.TestCase):
+    """Story 4-4: timing labels cold/warm, judges the total, keeps the proxy subverdict."""
+
+    def test_cold_and_warm_are_separate_records_never_overwritten(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("--warm", body)
+        self.assertIn("--cold", body)
+        self.assertIn("session_kind", body)
+        self.assertIn("last-session-timing-${session_kind}.txt", body,
+                      "cold and warm records must be preserved separately")
+        self.assertIn("session-timing-history.log", body,
+                      "history must be appended, never truncated blindly")
+
+    def test_total_invocation_to_ready_is_judged_not_proxy_only(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("total_invocation_to_ready_s", body)
+        self.assertIn("prd_budget_30s_total", body,
+                      "the total verdict must be recorded against the 30s budget")
+        self.assertIn("proxy_ready_subverdict_30s", body,
+                      "the proxy-ready subverdict must be preserved separately")
+        # The judged value is the total, derived from invocation to ready.
+        self.assertIn("guest_start_s", body,
+                      "total must derive from invocation-to-ready, not session end alone")
+        self.assertRegex(body, r"if\s*\(\(\s*total_ready_s\s*>\s*30\s*\)\)",
+                         "the 30s verdict must judge the total")
+
+    def test_timing_records_decomposition_with_one_host_note(self):
+        body = function_body(CLI, "cmd_opencode")
+        for field in ("proxy_to_healthy_s", "kata_guest_boot_s",
+                      "total_invocation_to_ready_s", "total_session_s"):
+            self.assertIn(field, body, "%s must be recorded" % field)
+        self.assertIn("one host, one day", body)
+        self.assertIn("not a guarantee", body)
+        self.assertIn("miss", body.lower())
+        self.assertIn("NFR14", body, "a miss must point at a PRD amendment, not a code fix")
+
+    def test_timing_uses_if_blocks_not_bare_and_lists(self):
+        body = function_body(CLI, "cmd_opencode")
+        # Timing verdicts run under set -euo pipefail; bare &&-lists are
+        # exempt only by list-semantics subtlety this file avoids elsewhere.
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[[") and "]] &&" in stripped:
+                self.fail("bare &&-list in cmd_opencode under set -e: %s" % stripped)
+
+
+class TestSessionTimingExecuted(unittest.TestCase):
+    """Story 4-4 executed: the real timing block runs with fixture clocks.
+
+    Substring checks above pass on comments alone; an inverted verdict arm,
+    a total computed from session end, a `>` truncating history, or a dropped
+    `cp` latest all keep them green while recording wrong numbers. This runs
+    the actual block extracted from `cmd_opencode` so behavior is observed.
+    """
+
+    def _block(self):
+        body = function_body(CLI, "cmd_opencode")
+        start = body.index("local total_ready_s=")
+        end = (body.index("session-timing-history.log\"")
+               + len("session-timing-history.log\""))
+        return body[start:end]
+
+    def _run(self, kind, guest_boot, guest_start=105, session_start=100,
+             proxy_s=5, total_session=200, tmp=None, history_seed=None):
+        block = self._block()
+        var_dir = tmp or tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            var_dir, ignore_errors=True))
+        if history_seed is not None:
+            with open(os.path.join(var_dir, "session-timing-history.log"),
+                      "w", encoding="utf-8") as fh:
+                fh.write(history_seed)
+        script = "\n".join([
+            "set -euo pipefail",
+            "run_timing() {",
+            '  local session_kind="$1" guest_boot_s="$2" guest_start_s="$3"'
+            ' session_start_s="$4" proxy_s="$5" total_session_s="$6"'
+            ' SECUREAI_VAR="$7"',
+            block,
+            "}",
+            'run_timing "%s" "%s" "%s" "%s" "%s" "%s" "%s"' % (
+                kind, guest_boot, guest_start, session_start,
+                proxy_s, total_session, var_dir),
+        ])
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=30)
+        self.assertEqual(result.returncode, 0,
+                         "timing block must exit 0: %s" % result.stderr)
+        return var_dir
+
+    def _read(self, var_dir, name):
+        with open(os.path.join(var_dir, name), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_total_met_and_proxy_subverdict(self):
+        var_dir = self._run("cold", "10")
+        content = self._read(var_dir, "last-session-timing-cold.txt")
+        self.assertIn("total_invocation_to_ready_s: 15", content)
+        self.assertIn("prd_budget_30s_total: MET", content)
+        self.assertIn("proxy_ready_subverdict_30s: MET", content)
+        self.assertIn("kind: cold", content)
+        latest = self._read(var_dir, "last-session-timing.txt")
+        self.assertIn("kind: cold", latest)
+
+    def test_total_over_budget_reports_not_met(self):
+        var_dir = self._run("warm", "40")
+        content = self._read(var_dir, "last-session-timing-warm.txt")
+        self.assertIn("total_invocation_to_ready_s: 45", content)
+        self.assertIn("prd_budget_30s_total: NOT MET", content)
+        self.assertIn("proxy_ready_subverdict_30s: MET", content)
+
+    def test_unknown_boot_is_not_met(self):
+        var_dir = self._run("cold", "unknown")
+        content = self._read(var_dir, "last-session-timing-cold.txt")
+        self.assertIn("total_invocation_to_ready_s: unknown", content)
+        self.assertIn("prd_budget_30s_total: NOT MET", content)
+
+    def test_cold_and_warm_preserved_with_appended_history(self):
+        var_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            var_dir, ignore_errors=True))
+        self._run("cold", "10", tmp=var_dir)
+        self._run("warm", "40", tmp=var_dir)
+        cold = self._read(var_dir, "last-session-timing-cold.txt")
+        warm = self._read(var_dir, "last-session-timing-warm.txt")
+        self.assertIn("kind: cold", cold)
+        self.assertIn("kind: warm", warm)
+        self.assertIn("total_invocation_to_ready_s: 15", cold)
+        self.assertIn("total_invocation_to_ready_s: 45", warm)
+        history = self._read(var_dir, "session-timing-history.log")
+        self.assertIn("kind: cold", history)
+        self.assertIn("kind: warm", history)
+
+
+class TestProxyHealthPolicyGate(unittest.TestCase):
+    """Story 2-6: health reflects policy loaded in-process, not just a socket."""
+
+    def test_compose_healthcheck_proves_policy_loads(self):
+        compose = read(COMPOSE)
+        self.assertIn("is_healthy", compose,
+                      "the healthcheck must exercise the addon policy, not just a socket")
+        self.assertIn("import addon", compose)
+        # The raw-socket proof is kept: the proxy must still answer on its port.
+        self.assertIn("CONNECT", compose)
+        self.assertIn("timeout: 5s", compose)
+
+    def test_compose_keeps_service_healthy_as_declarative_backup(self):
+        compose = read(COMPOSE)
+        cli = read(CLI)
+        self.assertIn("condition: service_healthy", compose)
+        # The CLI poll loop is the enforcing gate under --no-deps; both files
+        # must document it so a future removal of either is caught.
+        self.assertIn("--no-deps", compose,
+                      "compose must document the --no-deps enforcing-gate contract")
+        self.assertIn("--no-deps", cli,
+                      "the CLI must document the --no-deps enforcing gate it relies on")
+        self.assertRegex(compose, r"(?i)enforcing gate|ENFORCING",
+                         "compose must document the CLI poll loop as the enforcing gate")
+
+    def test_addon_startup_hooks_exist(self):
+        source = read(os.path.join(REPO_ROOT, "proxy", "addon.py"))
+        for hook in ("def configure", "def is_healthy"):
+            self.assertIn(hook, source, "%s must exist for eager health gating" % hook)
+        self.assertIn("_ready", source)
+
+
+class TestProxyHealthcheckExecuted(unittest.TestCase):
+    """Story 2-6 executed: the composed healthcheck runs, not just reads.
+
+    Substring checks above stay green if the socket guard is deleted, the
+    `sys.path` points elsewhere, or `${SECUREAI_PROXY_PORT}` never
+    interpolates. This runs the exact `-c` body from `docker-compose.yml`
+    (port substituted; the container path `/opt/secureai` mapped to the repo
+    `proxy/` dir as the only documented test adaptation, with a mitmproxy
+    stub standing in for the image's installed mitmproxy) against a loopback
+    CONNECT stub and fixture configs, asserting exit codes.
+    """
+
+    def _snippet(self):
+        compose = read(COMPOSE)
+        self.assertIn("${SECUREAI_PROXY_PORT}", compose,
+                      "the healthcheck port must interpolate from compose.env")
+        start = compose.index("import socket,sys;")
+        end = (compose.index("is_healthy() else 1)")
+               + len("is_healthy() else 1)"))
+        # YAML `>-` folds newlines to spaces at runtime; mimic the fold so the
+        # executed form matches what the container runs.
+        return " ".join(compose[start:end].split())
+
+    def _stub_mitmproxy(self, root):
+        pkg = os.path.join(root, "mitmproxy")
+        os.makedirs(pkg, exist_ok=True)
+        with open(os.path.join(pkg, "__init__.py"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("")
+        with open(os.path.join(pkg, "http.py"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("class Response:\n"
+                     "    def __init__(self, status_code=200, content=b\"\"):\n"
+                     "        self.status_code = status_code\n"
+                     "        self.content = content\n"
+                     "    @classmethod\n"
+                     "    def make(cls, status_code=200, content=b\"\"):\n"
+                     "        return cls(status_code, content)\n")
+
+    def _write_config(self, root, whitelist=None):
+        os.makedirs(root, exist_ok=True)
+        wl = whitelist if whitelist is not None else ["api.example.test"]
+        with open(os.path.join(root, "whitelist.yaml"), "w",
+                  encoding="utf-8") as fh:
+            for host in wl:
+                fh.write('- "%s"\n' % host)
+        with open(os.path.join(root, "keys.yaml"), "w",
+                  encoding="utf-8") as fh:
+            fh.write('"api.example.test": "test-key"\n')
+        with open(os.path.join(root, "settings.yaml"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("cache_ttl_seconds: 5\n")
+
+    def _serve(self):
+        import socket as _socket
+        import threading as _threading
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(5)
+        stop = _threading.Event()
+
+        def _loop():
+            srv.settimeout(0.5)
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except _socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    conn.settimeout(3)
+                    try:
+                        conn.recv(256)
+                    except OSError:
+                        pass
+                    try:
+                        conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+                    except OSError:
+                        pass
+                finally:
+                    conn.close()
+
+        thread = _threading.Thread(target=_loop, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(srv.close)
+        return port
+
+    def _run(self, port, config_dir):
+        import tempfile as _tf
+        stub_root = _tf.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            stub_root, ignore_errors=True))
+        self._stub_mitmproxy(stub_root)
+        proxy_dir = os.path.join(REPO_ROOT, "proxy")
+        body = self._snippet().replace("${SECUREAI_PROXY_PORT}", str(port))
+        body = body.replace("/opt/secureai", proxy_dir)
+        env = {**os.environ,
+               "SECUREAI_CONFIG_DIR": config_dir,
+               "SECUREAI_PLACEHOLDER_KEY": "sk-secureai-placeholder",
+               "PYTHONPATH": stub_root + os.pathsep + os.environ.get(
+                   "PYTHONPATH", "")}
+        return subprocess.run(["python3", "-c", body], capture_output=True,
+                              text=True, timeout=30, env=env)
+
+    def test_healthy_when_socket_answers_and_policy_loads(self):
+        import tempfile as _tf
+        config_dir = _tf.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            config_dir, ignore_errors=True))
+        self._write_config(config_dir)
+        result = self._run(self._serve(), config_dir)
+        self.assertEqual(result.returncode, 0,
+                         "socket + policy must exit 0: %s" % result.stderr)
+
+    def test_unhealthy_when_socket_refuses(self):
+        import socket as _socket
+        import tempfile as _tf
+        probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        config_dir = _tf.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            config_dir, ignore_errors=True))
+        self._write_config(config_dir)
+        result = self._run(port, config_dir)
+        self.assertNotEqual(result.returncode, 0,
+                            "refused socket must exit non-zero")
+
+    def test_unhealthy_when_policy_missing(self):
+        import tempfile as _tf
+        config_dir = _tf.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            config_dir, ignore_errors=True))
+        os.makedirs(config_dir, exist_ok=True)
+        result = self._run(self._serve(), config_dir)
+        self.assertNotEqual(result.returncode, 0,
+                            "missing whitelist must exit non-zero")
+
+
 if __name__ == "__main__":
     unittest.main()

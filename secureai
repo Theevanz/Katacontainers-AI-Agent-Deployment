@@ -805,6 +805,16 @@ teardown_session() {
 }
 
 cmd_opencode() {
+  # Story 4.4: cold vs warm is an explicit label, not an inference. Cold is a
+  # first run after build or reboot (VM boot + caches cold); warm is a second
+  # consecutive run (caches warm). The flag selects which record is written;
+  # writing one never overwrites the other.
+  local session_kind="cold"
+  if [[ "${1:-}" == "--warm" ]]; then session_kind="warm"; shift || true
+  elif [[ "${1:-}" == "--cold" ]]; then session_kind="cold"; shift || true
+  elif [[ -n "${1:-}" ]]; then die "usage: secureai opencode [--cold|--warm]
+  '${1}' is not a session kind; timing records are labeled cold or warm, so an
+  unrecognized flag would mislabel the measurement."; fi
   need_root
   need_docker
   cmd_init_config >/dev/null
@@ -948,6 +958,7 @@ cmd_opencode() {
   GUEST_WATCHDOG_PID=$!
 
   local rc=0
+  local guest_start_s="$SECONDS"
   compose run --rm --no-deps -it --name "$SECUREAI_OPENCODE_CONTAINER" opencode || rc=$?
   local session_end_s="$SECONDS"
 
@@ -971,27 +982,51 @@ cmd_opencode() {
   GUEST_BOOT_SECONDS_FILE=""
 
   local proxy_s=$(( healthy_since_s - proxy_start_s ))
-  local total_s=$(( session_end_s - session_start_s ))
-  # The PRD's 30s budget is about the trusted zone becoming usable: the proxy
-  # answering, and the guest being told to start. It is NOT about the Kata VM
-  # finishing its boot -- that is the cost of the isolation model itself (AD-6),
-  # not overhead this project can remove. Both numbers are recorded so the
-  # distinction is data rather than argument.
-  local budget_verdict="MET"
-  (( proxy_s > 30 )) && budget_verdict="NOT MET"
+  local total_session_s=$(( session_end_s - session_start_s ))
+  # Story 4.4: the PRD's 30s budget (NFR6) is judged on TOTAL
+  # invocation-to-ready -- from `secureai opencode` to the agent ready to
+  # accept input -- not on proxy readiness alone. Agent-ready is derived from
+  # container-running (the watchdog's guest_boot_s) plus total elapsed; it is
+  # explicitly a MEASUREMENT on one host on one day, not a readiness probe
+  # into the TUI and not a guarantee about every machine.
+  # The proxy-ready subverdict is preserved separately so the trusted-zone cost
+  # stays visible alongside the total. A miss changes NO code: performance
+  # tuning is out of MVP scope (NFR14), so a miss is recorded as a PRD
+  # amendment to discuss, not a defect to optimise away.
+  local total_ready_s="unknown" total_verdict="NOT MET" proxy_verdict="MET"
+  if [[ "$guest_boot_s" =~ ^[0-9]+$ ]]; then
+    total_ready_s=$(( (guest_start_s - session_start_s) + guest_boot_s ))
+  fi
+  if [[ "$total_ready_s" =~ ^[0-9]+$ ]]; then
+    if (( total_ready_s > 30 )); then total_verdict="NOT MET"; else total_verdict="MET"; fi
+  else
+    total_verdict="NOT MET"
+  fi
+  if (( proxy_s > 30 )); then proxy_verdict="NOT MET"; fi
   {
+    printf 'kind: %s\n' "$session_kind"
     printf 'measured_on: %s\n' "$(date -Is)"
     printf 'host: %s\n' "$(uname -srm)"
     printf 'proxy_to_healthy_s: %s\n' "$proxy_s"
     printf 'kata_guest_boot_s: %s\n' "$guest_boot_s"
-    printf 'total_session_s: %s\n' "$total_s"
-    printf 'prd_budget_30s: %s\n' "$budget_verdict"
-    printf 'note: one host, one day. The budget covers proxy readiness; the Kata\n'
-    printf 'guest boot is separate and inherent to running the agent in a VM.\n'
-  } >"${SECUREAI_VAR}/last-session-timing.txt"
-  ok "session timing recorded at ${SECUREAI_VAR}/last-session-timing.txt"
-  printf '  Session timing: proxy-ready in %ss, Kata VM boot %ss, total %ss, 30s budget %s\n' \
-    "$proxy_s" "$guest_boot_s" "$total_s" "$budget_verdict"
+    printf 'total_invocation_to_ready_s: %s\n' "$total_ready_s"
+    printf 'total_session_s: %s\n' "$total_session_s"
+    printf 'prd_budget_30s_total: %s\n' "$total_verdict"
+    printf 'proxy_ready_subverdict_30s: %s\n' "$proxy_verdict"
+    printf 'note: one host, one day. This is a measurement, not a guarantee.\n'
+    printf 'note: the budget covers total invocation-to-ready; Kata guest boot is\n'
+    printf 'separate and inherent to running the agent in a VM (AD-6, NFR6).\n'
+    printf 'note: a miss changes no code; record as a PRD amendment (NFR14).\n'
+  } >"${SECUREAI_VAR}/last-session-timing-${session_kind}.txt"
+  # Preserve the other kind's record: writing cold never overwrites warm and
+  # vice versa. Keep last-session-timing.txt as the latest for existing
+  # readers, and append every run to an ever-growing history that is never
+  # truncated blindly.
+  cp "${SECUREAI_VAR}/last-session-timing-${session_kind}.txt" "${SECUREAI_VAR}/last-session-timing.txt"
+  cat "${SECUREAI_VAR}/last-session-timing-${session_kind}.txt" >>"${SECUREAI_VAR}/session-timing-history.log"
+  ok "session timing (${session_kind}) recorded at ${SECUREAI_VAR}/last-session-timing-${session_kind}.txt"
+  printf '  Session timing [%s]: proxy-ready in %ss, Kata VM boot %ss, total-ready %ss, total-session %ss, 30s total %s (proxy subverdict %s)\n' \
+    "$session_kind" "$proxy_s" "$guest_boot_s" "$total_ready_s" "$total_session_s" "$total_verdict" "$proxy_verdict"
 
   if [[ "$guest_never_started" -eq 1 ]]; then
     teardown_session
@@ -1380,9 +1415,12 @@ secureai -- OpenCode inside a Kata VM, behind a proxy that holds your keys.
 
 usage: secureai <command> [arguments]
 
-  opencode                 Start a session: proxy first, then the agent.
+  opencode [--cold|--warm]  Start a session: proxy first, then the agent.
                            You land INSIDE the agent; both containers are
-                           removed when you leave.
+                           removed when you leave. --cold (default) is a
+                           first run after build/reboot; --warm is a second
+                           run. Timing is recorded separately per kind
+                           against the 30s budget (Story 4.4).
   down                     Stop and remove any running containers.
   status                   Show what is running, and the Docker/Kata pairing.
   whitelist add <domain>   Allow an extra domain. Live: no restart needed.

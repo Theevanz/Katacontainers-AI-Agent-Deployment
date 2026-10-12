@@ -154,6 +154,73 @@ class SecureAIAddon:
     # Process-global by nature, and deliberately free of request state.
     _cache = None
 
+    def __init__(self):
+        # Readiness for health gating (Story 2.6): False until the first
+        # successful policy load. Request handling itself stays fail-closed
+        # via _policy() returning None, so this flag is advisory for health
+        # and never a second policy source.
+        self._ready = False
+
+    # ------------------------------------------------------------------
+    # startup eager load (Story 2.6)
+    # ------------------------------------------------------------------
+    def _eager_load(self):
+        """Load policy once at startup so health cannot pass before keys.
+
+        This does NOT replace the per-flow mtime-bounded reread in _policy():
+        startup load closes the healthy-before-keys race, while reread keeps
+        `whitelist add` live without a restart (AD-13).
+        """
+        try:
+            policy, error = self._policy()
+        except Exception as exc:  # never let startup crash on config
+            self._ready = False
+            logger.warning(
+                "policy not ready reason=%s",
+                ("%s" % exc).replace("\n", " ")[:160] or "startup-error",
+            )
+            return None, "startup-error"
+        self._ready = policy is not None
+        if policy is None:
+            logger.warning(
+                "policy not ready reason=%s",
+                (error or "-").replace("\n", " ")[:160],
+            )
+        else:
+            logger.warning("policy loaded hosts=%d", len(policy["hosts"]))
+        return policy, error
+
+    def configure(self, updated=None):
+        """mitmproxy startup hook: eager-load before the proxy listens.
+
+        Because mitmproxy loads addons before listening, a healthcheck that
+        requires listening cannot pass before this has attempted a load.
+        Until a load succeeds every request fails closed via _policy().
+        """
+        self._eager_load()
+
+    def load(self, loader=None):
+        """Older mitmproxy startup entry: same eager load as configure."""
+        self._eager_load()
+
+    def start(self):
+        """Late startup entry (some runners call start, not configure)."""
+        self._eager_load()
+
+    def is_healthy(self):
+        """True only when policy loads in-process (Story 2.6).
+
+        Health must never report healthy before keys are in-process: a first
+        request must not race key loading. Missing keys.yaml is valid
+        (zero-keys mode, unauthenticated hosts still pass); an unreadable or
+        unparseable whitelist is config-error and reports unhealthy.
+        Records the outcome in _ready so the flag and the verdict cannot
+        diverge for a future caller.
+        """
+        policy, _ = self._policy()
+        self._ready = policy is not None
+        return self._ready
+
     # ------------------------------------------------------------------
     # config
     # ------------------------------------------------------------------

@@ -10,6 +10,7 @@ import importlib.util
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -506,6 +507,59 @@ class TestSourceContract(unittest.TestCase):
         self.assertNotIn("Response.make", hook)
 
 
+class TestAddonEagerLoad(AddonTestCase):
+    """Story 2-6: health cannot pass before keys are in-process."""
+
+    def setUp(self):
+        super().setUp()
+        # Fresh cache per test: _cache is process-global by design, so a
+        # previous test's warm entry must not masquerade as this test's load.
+        self.addon._cache = None
+        addon.SecureAIAddon._cache = None
+        self.addon._ready = False
+
+    def test_configure_eager_loads_and_reports_ready(self):
+        write_config(self.config_dir)
+        with self.assertLogs("secureai", level="WARNING") as logs:
+            self.addon.configure()
+        self.assertTrue(self.addon._ready, "successful eager load must mark ready")
+        self.assertTrue(self.addon.is_healthy())
+        self.assertIn("policy loaded", "\n".join(logs.output))
+
+    def test_is_healthy_false_when_whitelist_missing(self):
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.assertFalse(self.addon.is_healthy(),
+                         "no healthy before keys are in-process")
+        self.assertFalse(self.addon._ready or self.addon.is_healthy())
+
+    def test_fail_closed_until_loaded(self):
+        os.makedirs(self.config_dir, exist_ok=True)
+        with self.assertLogs("secureai", level="WARNING"):
+            flow = self.request()
+        self.assertIsNotNone(flow.response)
+        self.assertEqual(flow.response.status_code, 403)
+        self.assertEqual(flow.metadata["secureai"]["decision"], "config-error")
+
+    def test_start_and_load_aliases_eager_load(self):
+        write_config(self.config_dir)
+        for hook in ("load", "start"):
+            inst = addon.SecureAIAddon()
+            inst._cache = None
+            getattr(inst, hook)()
+            self.assertTrue(inst.is_healthy(), "%s must eager-load" % hook)
+
+    def test_per_flow_reread_still_works_after_eager_load(self):
+        write_config(self.config_dir)
+        self.addon.configure()
+        with self.assertLogs("secureai", level="WARNING"):
+            self.assertIsNotNone(self.request(host=OTHER_HOST).response)
+        write_config(self.config_dir, whitelist=[API_HOST, OTHER_HOST], keys={})
+        with self.assertNoLogs("secureai", level="WARNING"):
+            flow = self.request(host=OTHER_HOST, headers={"user-agent": "x"})
+        self.assertIsNone(flow.response,
+                           "mtime reread must survive eager load (whitelist add live)")
+
+
 class TestTreeContract(unittest.TestCase):
     """Static checks over the SHIPPED artifacts only.
 
@@ -587,6 +641,100 @@ class TestTreeContract(unittest.TestCase):
                 offenders.append(n)
         self.assertEqual(offenders, [], "CLI must pass no runtime-override flag")
 
+    def test_proxy_port_literal_lives_only_in_the_seed(self):
+        """SECUREAI_PROXY_PORT's value may exist only in config/compose.env.
+
+        AD-11: every other shipped artifact references it as ${...}. The one
+        legitimate exception is the image metadata `EXPOSE 8080` in
+        proxy/Dockerfile, which declares the container port rather than
+        copying the cross-boundary constant into config.
+        """
+        seed = os.path.join("config", "compose.env")
+        offenders = []
+        for p in self._shipped_files():
+            rel = os.path.relpath(p, REPO_ROOT)
+            if rel == seed:
+                continue
+            content = _read(p)
+            if "8080" not in content:
+                continue
+            # Allow exactly the EXPOSE declaration and nothing else.
+            lines = [l for l in content.splitlines()
+                     if "8080" in l and l.strip() and not l.strip().startswith("#")]
+            allowed = all(l.strip().startswith("EXPOSE ") for l in lines)
+            if not allowed:
+                offenders.append(rel)
+        self.assertEqual(offenders, [],
+                         "only config/compose.env may hold 8080 (besides EXPOSE)")
+
+    def test_placeholder_literal_lives_only_in_the_seed(self):
+        """The placeholder value is one constant, never a duplicated literal.
+
+        AD-11: config/compose.env owns SECUREAI_PLACEHOLDER_KEY; every other
+        shipped artifact references it as ${...}.
+        """
+        seed = os.path.join("config", "compose.env")
+        needle = "sk-secureai-" + "placeholder"
+        offenders = [
+            os.path.relpath(p, REPO_ROOT)
+            for p in self._shipped_files()
+            if needle in _read(p) and os.path.relpath(p, REPO_ROOT) != seed
+        ]
+        self.assertEqual(offenders, [],
+                         "only config/compose.env may hold the placeholder literal")
+
+    def test_guest_dockerfile_preseeds_provider_sdks(self):
+        """Story 1.7: the SDK set comes from models.json npm fields (AD-8).
+
+        A comment-only mkdir would leave runtime discovery to widen the
+        allowlist. The build must extract @ai-sdk/* from the vendored catalog
+        into /home/node/.cache/opencode/bin and fail naming the SDK set when
+        it is empty.
+        """
+        dockerfile = _read(os.path.join(REPO_ROOT, "opencode", "Dockerfile"))
+        self.assertIn("/home/node/.cache/opencode/bin", dockerfile)
+        self.assertIn("models.json", dockerfile)
+        # The npm fields are the single source: jq (already in the image) or
+        # python reading .npm.
+        self.assertTrue(".npm" in dockerfile or '"npm"' in dockerfile or "'npm'" in dockerfile,
+                        "the SDK set must be read from models.json npm fields")
+        self.assertIn("@ai-sdk/", dockerfile)
+        self.assertIn("npm install", dockerfile)
+        # Empty SDK set is a named build failure, not a runtime discovery.
+        self.assertRegex(dockerfile, r"no @ai-sdk/")
+
+    def test_guest_dockerfile_asserts_node_uid_1000(self):
+        """Story 1.7: the non-root user contract is enforced at build (AD-9)."""
+        dockerfile = _read(os.path.join(REPO_ROOT, "opencode", "Dockerfile"))
+        self.assertIn("id -u node", dockerfile)
+        self.assertIn("1000", dockerfile)
+
+    def test_guest_install_layer_never_uses_musl(self):
+        """Story 1.7: glibc base means never -musl (AD-9).
+
+        Comments may explain why -musl is forbidden; only CODE lines that
+        install are checked, so the guard itself does not trip this test.
+        """
+        dockerfile = _read(os.path.join(REPO_ROOT, "opencode", "Dockerfile"))
+        offenders = []
+        for line in dockerfile.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "-musl" not in line:
+                continue
+            # The refusing guard names -musl to reject it; an INSTALL names it
+            # to use it. Only the latter is forbidden.
+            is_guard = ("FATAL" in line or "refusing" in line.lower()
+                        or stripped.startswith("case "))
+            is_install = ("npm install" in line or "install --" in line
+                          or "opencode-ai@" in line)
+            if is_install and not is_guard:
+                offenders.append(stripped)
+        self.assertEqual(offenders, [], "no install line may reference -musl")
+        # And the guard that refuses a musl variant must exist.
+        self.assertIn("-musl", dockerfile, "a refusing guard must name what it refuses")
+
     def test_installer_is_the_only_writer_of_daemon_json(self):
         """No shipped artifact may WRITE daemon.json (AD-6).
 
@@ -615,6 +763,73 @@ class TestTreeContract(unittest.TestCase):
                     if any(tok in probe for tok in writers):
                         offenders.append("%s:%d" % (name, n))
         self.assertEqual(offenders, [], "only install-fedora.sh may write daemon.json")
+
+
+class TestGuestBuildGuardsExecuted(unittest.TestCase):
+    """Story 1-7: the Dockerfile build gates run, not just read.
+
+    Source-text checks above let a dash-only breakage ship green (the
+    `${SDK_SET// /}` empty test aborts under dash before the FATAL). These
+    tests execute the real pipeline and shell fragments.
+    """
+
+    EXPECTED_SDKS = sorted([
+        "@ai-sdk/anthropic",
+        "@ai-sdk/google",
+        "@ai-sdk/mistral",
+        "@ai-sdk/openai",
+        "@ai-sdk/openai-compatible",
+    ])
+
+    def test_sdk_pipeline_yields_the_five_catalog_sdks(self):
+        catalog = os.path.join(REPO_ROOT, "opencode", "models.json")
+        jq = subprocess.run(
+            ["jq", "-r", ".. | .npm? // empty", catalog],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(jq.returncode, 0, jq.stderr)
+        names = sorted({l.strip() for l in jq.stdout.splitlines()
+                        if l.strip().startswith("@ai-sdk/")})
+        self.assertEqual(names, self.EXPECTED_SDKS)
+
+    def test_posix_emptiness_fragment(self):
+        script = (
+            'if [ -z "$(printf \'%s\' "$SDK_SET" | tr -d \'[:space:]\')" ]; then '
+            'echo EMPTY; exit 1; else echo NONEMPTY; exit 0; fi')
+        full = subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, timeout=30,
+                              env={**os.environ, "SDK_SET": "a b"})
+        self.assertEqual((full.returncode, full.stdout.strip()), (0, "NONEMPTY"))
+        blank = subprocess.run(["bash", "-c", script], capture_output=True,
+                               text=True, timeout=30,
+                               env={**os.environ, "SDK_SET": "   "})
+        self.assertEqual((blank.returncode, blank.stdout.strip()), (1, "EMPTY"))
+        dockerfile = _read(os.path.join(REPO_ROOT, "opencode", "Dockerfile"))
+        self.assertNotIn("${SDK_SET//", dockerfile,
+                         "bash-only substitution must not appear in a dash RUN")
+        self.assertIn("tr -d", dockerfile)
+
+    def test_uid_and_musl_fragments(self):
+        uid_frag = '[ "$(id -u node)" = "1000" ]'
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = os.path.join(tmp, "id")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write('#!/bin/bash\necho "$ID_STUB_UID"\n')
+            os.chmod(stub, 0o755)
+            env = {**os.environ, "PATH": tmp + os.pathsep + os.environ.get("PATH", "")}
+            for uid, expected in (("1000", 0), ("1001", 1)):
+                env["ID_STUB_UID"] = uid
+                result = subprocess.run(["bash", "-c", uid_frag],
+                                        capture_output=True, text=True,
+                                        timeout=30, env=env)
+                self.assertEqual(result.returncode, expected,
+                                 "UID %s must exit %d" % (uid, expected))
+        musl_frag = ('case "${OPENCODE_VERSION:-}" in *-musl*) exit 1;; esac; exit 0')
+        for version, expected in (("1.18.34", 0), ("1.18.34-musl", 1)):
+            result = subprocess.run(["bash", "-c", musl_frag], capture_output=True,
+                                    text=True, timeout=30,
+                                    env={**os.environ, "OPENCODE_VERSION": version})
+            self.assertEqual(result.returncode, expected,
+                             "version %s must exit %d" % (version, expected))
 
 
 if __name__ == "__main__":
