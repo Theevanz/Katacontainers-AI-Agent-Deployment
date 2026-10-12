@@ -13,9 +13,11 @@ Shape rules this file obeys, and why:
 * ``responseheaders`` sets ``.stream = True`` for ``text/event-stream`` before
   any body is read, or mitmproxy buffers an entire LLM response and the stream
   never emits a token (AD-3).
-* The addon fails CLOSED.  Unreadable / unparseable / missing config, an
-  unknown host, or an allowlisted host with no key all produce 403.  There is
-  no passthrough path and no default-allow (AD-13, AD-15).
+* The addon fails CLOSED for policy.  Unreadable / unparseable whitelist, an
+  unknown host, or a placeholder-presented-without-key all produce 403.  There
+  is no default-allow (AD-13, AD-15).  Missing keys.yaml or an empty keys file
+  simply means zero keys: unauthenticated baseline hosts (git, pip, npm)
+  still pass through, only authenticated hosts 403 with `nokey`.
 * There is no host literal anywhere in this file.  The allowlist file is the
   only policy source (AD-15).
 * Log lines never contain key material and never contain header values.  The
@@ -36,6 +38,18 @@ import yaml
 import mitmproxy.http
 
 logger = logging.getLogger("secureai")
+# Emit WARNING+ to stderr explicitly. mitmproxy's own terminal log only shows
+# records routed through its event queue -- a bare stdlib logger depends on
+# root-handler fallback that is NOT guaranteed inside the mitmdump process,
+# which is how enforcement could act (403) while leaving docker logs and
+# /var/lib/secureai/proxy.log EMPTY (and `secureai verify` blind). An
+# explicit handler makes the decision log unconditional.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setLevel(logging.WARNING)
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.WARNING)
 
 # --- names, not values ---------------------------------------------------
 # Config file names are referenced by name only; their directory comes from
@@ -174,7 +188,14 @@ class SecureAIAddon:
         return data
 
     def _load_policy(self, signature):
-        settings = self._read_yaml(SETTINGS_BASENAME, {}) or {}
+        # settings.yaml is tunables, not policy: a missing file means defaults
+        # (TTL 5s, plaintext denied), never a full block. Only an unreadable
+        # or mis-shaped file fails closed.
+        settings_path = self._path(SETTINGS_BASENAME)
+        if not os.path.exists(settings_path):
+            settings = {}
+        else:
+            settings = self._read_yaml(SETTINGS_BASENAME, {}) or {}
         if not isinstance(settings, dict):
             raise ConfigError("%s is not a mapping" % SETTINGS_BASENAME)
 
@@ -213,7 +234,15 @@ class SecureAIAddon:
         if not hosts:
             raise ConfigError("%s lists no host" % WHITELIST_BASENAME)
 
-        keys_raw = self._read_yaml(KEYS_BASENAME, {}) or {}
+        # keys.yaml is optional: missing or empty means zero keys (no-keys
+        # mode). Unauthenticated baseline hosts still pass; only a request
+        # presenting the placeholder without a stored key 403s with `nokey`.
+        # An unreadable or mis-shaped keys file still fails closed.
+        keys_path = self._path(KEYS_BASENAME)
+        if not os.path.exists(keys_path):
+            keys_raw = {}
+        else:
+            keys_raw = self._read_yaml(KEYS_BASENAME, {}) or {}
         if not isinstance(keys_raw, dict):
             raise ConfigError("%s is not a mapping" % KEYS_BASENAME)
         keys = {}
@@ -401,16 +430,31 @@ class SecureAIAddon:
         need no key and denying them would make the baseline allowlist
         unusable. That is a deliberate distinction, not a hole: the placeholder
         is what signals "this host's key is held by the proxy", and a request
-        without it is not asking for a key.
+        without it is not asking for a key. This is what lets the stack run
+        with zero keys configured: unauthenticated hosts work out of the box,
+        and only authenticated hosts 403 with `nokey` until a key is stored.
         """
         # NB: not named `placeholder` -- a local of that name would shadow the
         # module-level placeholder() for the whole function body.
+        headers = flow.request.headers
+        # No-keys mode: a request with no auth headers at all is not asking
+        # for a key (git clone, npm/pip download). Pass through untouched,
+        # even if the placeholder constant is absent -- this keeps the
+        # baseline working with zero keys configured.
+        has_auth = False
+        for name in AUTH_HEADERS:
+            try:
+                if name in headers:
+                    has_auth = True
+                    break
+            except (TypeError, KeyError):
+                continue
+        if not has_auth:
+            return
         placeholder_value = placeholder()
         if not placeholder_value:
             self._deny(flow, host, scheme, "config-error", "placeholder constant absent")
             return
-
-        headers = flow.request.headers
         for name in AUTH_HEADERS:
             try:
                 if name not in headers:
@@ -449,3 +493,10 @@ class SecureAIAddon:
             # than one auth header, and leaving a second one unreplaced would
             # forward the placeholder upstream alongside the real key.
             continue
+
+
+# mitmproxy only runs hooks from objects in this module-level list. A bare
+# class definition is loaded but enforces NOTHING -- every flow passes
+# through uninspected and unbelogged, which is a silent fail-open of the
+# entire trust boundary (AD-1). This line is what makes the proxy enforce.
+addons = [SecureAIAddon()]

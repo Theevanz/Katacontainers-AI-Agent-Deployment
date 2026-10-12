@@ -133,7 +133,8 @@ class SecureAIAddon(mitmproxy.addons.Addon):
 - **Rule:** The guest env carries a literal `HTTPS_PROXY=http://10.211.0.10:8080`. The bridge
   subnet and proxy address are written **once**, in `compose.env` (AD-11), and consumed as
   `${...}` everywhere. Separately, the guest must not use Docker's embedded resolver:
-  `docker-compose.yml` sets `dns:` on the `opencode` service to the bridge gateway, and
+  `docker-compose.yml` sets `dns:` on the `opencode` service to public resolvers
+  (the bridge gateway runs no DNS), and
   `opencode/Dockerfile` does **not** bake `/etc/resolv.conf`. Upstream name resolution is
   guest-local and carries no enforcement meaning — SNI is the enforcement signal.
 - **Corollary:** `NO_PROXY=localhost,127.0.0.1,::1` is always set. Without it the TUI's loopback
@@ -154,9 +155,27 @@ class SecureAIAddon(mitmproxy.addons.Addon):
 - **Version matrix (one row, not a disjunction):** `features.time-namespaces: false` is written
   **only when Docker ≥ 29.5**, which otherwise breaks Kata with `invalid namespace type`
   (kata#13080, reproduced on F44 with Docker 29.5.1 + Kata 3.31.0). Below 29.5 the flag is not
-  written. `kata-qemu` is a **name**, not an executable; Docker points at
-  `containerd-shim-kata-v2` with `ConfigPath` under the runtime's `options`. The Go runtime is
+  written. `kata-qemu` is a **name**, not an executable; Docker is given the containerd
+  runtime **class** `io.containerd.kata.v2` — which it resolves to the `containerd-shim-kata-v2`
+  binary — with `ConfigPath` under the runtime's `options`. (The bare shim binary name is
+  rejected as an invalid runtime name.) The Go runtime is
   used because the Fedora package ships it; upstream defaults to runtime-rs since 4.0.0.
+- **Guest images are a separate precondition:** Kata boots a real VM, so it needs a guest
+  kernel and initrd under `/var/cache/kata-containers/`, which Fedora builds with
+  `kata-osbuilder-generate.service` — a unit it ships **disabled**. Nothing in Docker checks
+  for them: the runtime registers, both images build, the proxy starts, and only the Kata
+  container fails with `file …/vmlinuz.container does not exist`. The installer therefore
+  reads the `kernel`/`image` paths from the config it just wired up, builds them if absent,
+  and **asserts** they exist; the CLI re-checks per session, because the generated assets
+  symlink into `/lib/modules/<running-kernel>` and go dangling after a kernel update.
+- **The guest boot is bounded and explained:** because a VM boot precedes the agent's process,
+  `compose run -it` prints `Created` and then nothing. A pre-attach line says so, and a watchdog
+  bounds the wait (180s) — silent on success, because output there would corrupt the agent's TUI,
+  and on timeout it prints the container state, the QEMU process, the Kata sandbox dir and the
+  guest kernel path, then **removes the container** so the attach returns instead of hanging. An
+  agent that merely exited early (a `--rm` container that vanished) is not reported as a failed
+  boot. The PRD's 30s budget is measured against proxy readiness; the VM boot is recorded
+  separately, because it is the cost of the isolation model rather than project overhead.
 
 ### AD-7 — Multi-consumer host paths use `:z`; `:Z` is single-consumer only
 

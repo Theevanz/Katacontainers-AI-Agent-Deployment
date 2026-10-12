@@ -216,12 +216,469 @@ class TestInstallerRuntimeWiring(unittest.TestCase):
         # And the installer must refuse to continue if one ever appears.
         self.assertIn('if grep -q \'"default-runtime"\'', source)
 
-    def test_kata_runtime_uses_the_containerd_shim_not_a_path(self):
+    def test_kata_runtime_uses_the_containerd_runtime_class_not_the_shim_binary(self):
         source = read(INSTALLER)
-        self.assertIn("containerd-shim-kata-v2", source)
+        # Docker accepts a shim v2 runtime as the containerd RUNTIME CLASS
+        # `io.containerd.<name>.v2` (which it resolves to the
+        # containerd-shim-<name>-v2 binary) or as a full path. The bare shim
+        # binary name is rejected at container start:
+        #   failed to resolve runtime path: invalid runtime name
+        #   containerd-shim-kata-v2, correct runtime name should be either
+        #   format like `io.containerd.runc.v2` or a full path to the binary
+        self.assertIn('"runtimeType": "io.containerd.kata.v2"', source)
+        self.assertNotIn('"runtimeType": "containerd-shim-kata-v2"', source)
+        # And the installer must assert the class form after writing it, and
+        # observe what Docker actually loaded.
+        self.assertIn("""grep -q '"runtimeType"[[:space:]]""", source)
+        self.assertIn("docker info --format", source)
         # `kata-qemu` is a NAME, never an executable to invoke.
         self.assertNotIn("/usr/bin/kata-qemu", source)
         self.assertNotIn("/usr/libexec/kata-qemu", source)
+
+
+class TestKataRuntimeTypeGate(unittest.TestCase):
+    """The CLI's pre-session check on daemon.json's runtimeType.
+
+    EXECUTED, not structural: the function is extracted from the CLI and run
+    against fixture daemon.json files, because the whole point is that Docker
+    reports a bad runtimeType as *registered* and only rejects it when a
+    container is created.
+    """
+
+    def _run(self, daemon_json):
+        # function_body stops before the closing brace, so it is closed here.
+        body = function_body(CLI, "assert_kata_runtime_type") + "\n}"
+        script = "\n".join([
+            "die() { printf 'error: %s\\n' \"$*\" >&2; exit 1; }",
+            "ok()  { printf 'ok: %s\\n' \"$*\"; }",
+            body,
+            "assert_kata_runtime_type \"$1\"",
+        ])
+        return subprocess.run(
+            ["bash", "-c", script, "bash", daemon_json],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def _fixture(self, content):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_runtime_class_form_passes(self):
+        result = self._run(self._fixture(
+            '{"runtimes": {"kata": {"runtimeType": "io.containerd.kata.v2"}}}'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_explicit_binary_path_passes(self):
+        # Docker's other accepted form; the gate must not touch it.
+        result = self._run(self._fixture(
+            '{"runtimes": {"kata": {"runtimeType": "/usr/local/bin/containerd-shim-kata-v2"}}}'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_shim_binary_name_is_rejected_with_a_named_fix(self):
+        result = self._run(self._fixture(
+            '{"runtimes": {"kata": {"runtimeType": "containerd-shim-kata-v2"}}}'))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("io.containerd.kata.v2", result.stderr)
+        self.assertIn("systemctl restart docker", result.stderr)
+
+    def test_missing_daemon_json_is_not_a_failure(self):
+        # Nothing to assert means nothing to block; a die here would break
+        # every rootless/unmanaged host.
+        self.assertEqual(self._run("/nonexistent/daemon.json").returncode, 0)
+
+    def test_opencode_runs_the_gate_before_starting_anything(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("assert_kata_runtime_type", body)
+
+
+class KataGuestAssetsMixin:
+    """Fixtures for the Kata guest kernel/initrd checks.
+
+    Kata boots a real VM, so it needs a guest kernel and initrd that nothing in
+    Docker ever checks. Fedora builds them with kata-osbuilder-generate.service,
+    which it ships DISABLED, so a host can install cleanly and still fail every
+    session with `file /var/cache/kata-containers/vmlinuz.container does not
+    exist`.
+
+    These tests EXECUTE the real functions against fixture configs and a fake
+    `systemctl`, because the behaviour that matters -- calling the generator
+    only when something is missing, not hanging when it cannot help, and not
+    reporting a present-but-dangling symlink as usable -- cannot be seen by
+    matching source text.
+    """
+
+    # The functions are byte-identical in both files by design; the installer
+    # adds the build step, the CLI adds the pre-session gate.
+    ASSET_FNS = ("kata_guest_assets", "kata_missing_assets")
+
+    def _harness(self, source, functions, prelude=""):
+        """A bash script with the CLI's output helpers, a fake systemctl, and
+        the named functions extracted from the real file."""
+        helpers = "\n".join([
+            'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            'ok()   { printf "ok: %s\\n" "$*"; }',
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'log()  { printf "==> %s\\n" "$*"; }',
+            'sleep() { :; }',
+            'KATA_GENERATOR_RUNS=0',
+            'systemctl() {',
+            '  case "$1" in',
+            '    cat) [[ -n "$FAKE_UNIT" ]] && return 0 || return 1 ;;',
+            '    is-active) [[ -n "$FAKE_UNIT_ACTIVE" ]] && return 0 || return 1 ;;',
+            '  esac',
+            '  KATA_GENERATOR_RUNS=$((KATA_GENERATOR_RUNS+1))',
+            '  [[ -n "$FAKE_BUILD" ]] && { touch "$FAKE_BUILD";',
+            '    for p in $FAKE_FIX; do rm -f "$p"; touch "$p"; done; }',
+            '  return 0',
+            '}',
+        ])
+        bodies = "\n".join(function_body(source, name) + "\n}" for name in functions)
+        return "\n".join([helpers, prelude, bodies])
+
+    def _config(self, kernel, image=None):
+        """A Kata configuration.toml fixture with the given assets."""
+        lines = ["[hypervisor.qemu]",
+                 "  # Path to the kernel image to boot.",
+                 '  kernel = "%s"' % kernel]
+        if image:
+            lines.append('  image = "%s"' % image)
+        fd, path = tempfile.mkstemp(suffix=".toml")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _absent(self):
+        """A path that cannot exist, so the fixture never depends on the box."""
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        os.unlink(path)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _present(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _install(self, cfg, env, script):
+        return subprocess.run(
+            ["bash", "-c", script, "bash", cfg],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, **env},
+        )
+
+
+class TestKataGuestAssetParsing(KataGuestAssetsMixin, unittest.TestCase):
+    """Reading the asset paths out of Kata's own configuration."""
+
+    def _parse(self, cfg):
+        script = self._harness(INSTALLER, self.ASSET_FNS) + \
+            '\nkata_guest_assets "$1"\n'
+        return subprocess.run(
+            ["bash", "-c", script, "bash", cfg],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.split()
+
+    def test_kernel_and_image_are_read_from_the_config(self):
+        cfg = self._config("/var/cache/kata-containers/vmlinuz.container",
+                           "/var/cache/kata-containers/kata-containers-initrd.img")
+        self.assertEqual(
+            self._parse(cfg),
+            ["/var/cache/kata-containers/vmlinuz.container",
+             "/var/cache/kata-containers/kata-containers-initrd.img"],
+        )
+
+    def test_relative_paths_are_skipped_not_guessed_at(self):
+        # Kata resolves a relative kernel against its own runtime path, so
+        # asserting an absolute path here would either pass wrongly or fail
+        # wrongly. Skipping is the only honest answer.
+        cfg = self._config("vmlinux", "initrd.img")
+        self.assertEqual(self._parse(cfg), [])
+
+    def test_a_commented_out_kernel_is_not_read(self):
+        fd, path = tempfile.mkstemp(suffix=".toml")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write('# kernel = "/nope/vmlinuz.container"\n'
+                     '[hypervisor.qemu]\n  kernel = "/real/vmlinuz.container"\n')
+        self.addCleanup(os.unlink, path)
+        self.assertEqual(self._parse(path), ["/real/vmlinuz.container"])
+
+    def test_a_dangling_symlink_counts_as_missing(self):
+        # What a kernel update leaves behind: the symlink still resolves to a
+        # path name, but /lib/modules/<old-kernel> is gone. `-e` follows the
+        # link, so this is reported missing; testing -L would not.
+        target = self._absent()
+        link = self._present() + ".link"
+        self.addCleanup(lambda: os.path.islink(link) and os.unlink(link))
+        os.symlink(target, link)
+        cfg = self._config(link)
+        script = self._harness(INSTALLER, self.ASSET_FNS) + \
+            '\nkata_missing_assets "$1"\n'
+        out = subprocess.run(
+            ["bash", "-c", script, "bash", cfg],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        self.assertIn(link, out)
+
+
+class TestInstallerBuildsKataGuestAssets(KataGuestAssetsMixin, unittest.TestCase):
+    """The installer's remediation, with systemctl faked."""
+
+    def _run(self, cfg, env):
+        script = self._harness(
+            INSTALLER,
+            self.ASSET_FNS + ("ensure_kata_guest_assets",),
+            prelude='SECUREAI_KATA_CONFIG_PATH="$1"\n',
+        ) + ('\nensure_kata_guest_assets "$SECUREAI_KATA_CONFIG_PATH"\n'
+              'printf "GENERATOR_RUNS=%s\\n" "$KATA_GENERATOR_RUNS"\n')
+        return self._install(cfg, env, script)
+
+    def test_present_assets_are_left_alone(self):
+        # An installer re-run must not rebuild a multi-minute initrd.
+        cfg = self._config(self._present(), self._present())
+        result = self._run(cfg, {"FAKE_UNIT": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GENERATOR_RUNS=0", result.stdout)
+
+    def test_missing_assets_trigger_the_generator(self):
+        kernel, image = self._absent(), self._absent()
+        cfg = self._config(kernel, image)
+        result = self._run(cfg, {
+            "FAKE_UNIT": "1", "FAKE_BUILD": image, "FAKE_FIX": kernel,
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GENERATOR_RUNS=1", result.stdout)
+        self.assertIn("built", result.stdout)
+
+    def test_a_failed_generator_is_fatal_not_a_warning(self):
+        # Proceeding here produces an installed system whose every session dies
+        # with 'does not exist' -- the installer must not call that success.
+        cfg = self._config(self._absent(), self._absent())
+        result = self._run(cfg, {"FAKE_UNIT": "1"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("still missing", result.stderr)
+
+    def test_no_generator_on_the_host_fails_immediately(self):
+        # Nothing can produce the assets, so waiting would only burn time
+        # before the same failure. The fake `sleep` makes a hang detectable.
+        cfg = self._config(self._absent(), self._absent())
+        result = self._run(cfg, {"FAKE_UNIT": ""})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("kata-osbuilder-generate.service", result.stderr)
+        self.assertNotIn("GENERATOR_RUNS", result.stdout)
+
+    def test_main_calls_it_after_the_daemon_json_is_written(self):
+        # It reads the config path that write_daemon_json discovers, so it must
+        # run after it.
+        body = function_body(INSTALLER, "main")
+        self.assertLess(body.index("write_daemon_json"),
+                        body.index("ensure_kata_guest_assets"))
+
+
+class TestCliGuestAssetGate(KataGuestAssetsMixin, unittest.TestCase):
+    """The CLI's per-session gate, which is what catches the post-upgrade case."""
+
+    def _run(self, daemon_json, env=None):
+        script = self._harness(
+            CLI,
+            ("kata_config_path",) + self.ASSET_FNS
+            + ("kata_missing_guest_assets", "assert_kata_guest_assets"),
+        ) + '\nassert_kata_guest_assets\nprintf "GATE_PASSED\\n"\n'
+        # The CLI resolves the path from $SECUREAI_DAEMON_JSON, which is what
+        # makes the gate overridable for this test at all.
+        return self._install(daemon_json,
+                             {"SECUREAI_DAEMON_JSON": daemon_json, **(env or {})},
+                             script)
+
+    def _daemon_json(self, config_path=None):
+        opts = '' if config_path is None else \
+            ', "options": {"ConfigPath": "%s"}' % config_path
+        return self._present_json(
+            '{"runtimes": {"kata": {"runtimeType": "io.containerd.kata.v2"%s}}}'
+            % opts)
+
+    def _present_json(self, content):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_present_assets_pass(self):
+        cfg = self._config(self._present(), self._present())
+        result = self._run(self._daemon_json(cfg))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE_PASSED", result.stdout)
+
+    def test_missing_assets_fail_with_the_exact_command(self):
+        missing = self._absent()
+        cfg = self._config(missing)
+        result = self._run(self._daemon_json(cfg))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("systemctl restart kata-osbuilder-generate.service",
+                      result.stderr)
+        self.assertIn(missing, result.stderr)
+
+    def test_a_host_without_a_configured_path_is_not_blocked(self):
+        # Nothing can be determined, so nothing is asserted. A die here would
+        # break every host that lets Kata use its own defaults.
+        result = self._run(self._daemon_json(None))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE_PASSED", result.stdout)
+
+    def test_opencode_checks_before_starting_anything(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("assert_kata_guest_assets", body)
+        self.assertLess(body.index("assert_kata_guest_assets"),
+                        body.index("Starting OpenCode"))
+
+    def test_status_reports_the_guest_kernel(self):
+        # `status` is where an operator looks first, so absence must be visible
+        # there and not only as a die during a session.
+        body = function_body(CLI, "cmd_status")
+        self.assertIn("kata_missing_guest_assets", body)
+        self.assertIn("kata guest kernel", body)
+
+
+class TestGuestBootWatchdog(unittest.TestCase):
+    """Kata boots a real VM, so `compose run -it` goes silent before the attach.
+
+    Before this watchdog a guest that never booted left the session blocked
+    forever on an attach that would never produce output, with nothing on
+    screen to say so. These tests EXECUTE the real watchdog against a fake
+    docker on a virtual clock, because the properties that matter -- staying
+    silent on success, not firing when the agent merely exited early, and
+    actually removing the container so the attach returns -- are all invisible
+    to source matching.
+    """
+
+    def _harness(self, state_after, limit, removed=False):
+        events = tempfile.mktemp(suffix=".events")
+        self.addCleanup(lambda: os.path.exists(events) and os.unlink(events))
+        for suffix in (".marker", ".secs"):
+            path = events + suffix
+            self.addCleanup(lambda p=path: os.path.exists(p) and os.unlink(p))
+
+        script = "\n".join([
+            'warn() { printf " warn %s\n" "$*" >&2; }',
+            # Passthrough: the CLI wraps docker calls in `timeout` so a stuck
+            # shim cannot wedge the watchdog. A real `timeout` binary would
+            # bypass this harness's fake `docker` function (external binaries
+            # cannot see shell functions), so fake it -- production still uses
+            # the real coreutils timeout for hang protection.
+            'timeout() { shift; "$@"; }',
+            'SECUREAI_OPENCODE_CONTAINER=secureai-opencode',
+            'kata_config_path() { printf "%%s\\n" /dev/null; }',
+            'SECONDS=0',
+            ': >"$EVENTS"',
+            # A sleep that advances the clock, so `waited` and a virtual boot
+            # deadline agree without the suite taking minutes.
+            'sleep() { SECONDS=$((SECONDS+5)); }',
+            'boot_at() { (( SECONDS >= %d )) && printf running || printf created; }' % state_after,
+            'docker() {',
+            '  if [[ "$1" == "inspect" ]]; then',
+            '    %s && return 1' % ("true" if removed else "false"),
+            '    boot_at; return 0',
+            '  fi',
+            '  if [[ "$1" == "rm" ]]; then printf "REMOVED\\n" >>"$EVENTS"; fi',
+            '  return 0',
+            '}',
+            'pgrep() { printf "1\\n"; }',
+            'ls() { [[ "$1" == /run/vc/sandbox ]] && { printf "sandbox1\\n"; return 0; }; command ls "$@"; }',
+            function_body(CLI, "guest_boot_diagnostics") + "\n}",
+            function_body(CLI, "guest_boot_watchdog") + "\n}",
+            'GUEST_BOOT_MARKER="$EVENTS.marker"',
+            'GUEST_BOOT_SECONDS_FILE="$EVENTS.secs"',
+            'guest_boot_watchdog "%d"' % limit,
+            '[[ -s "$GUEST_BOOT_MARKER" ]] && printf "MARKER=failed\\n" || printf "MARKER=ok\\n"',
+            'printf "boot_s=%s\\n" "$(cat "$GUEST_BOOT_SECONDS_FILE" 2>/dev/null || echo none)"',
+            'printf "removed=%s\\n" "$(grep -c REMOVED "$EVENTS" || true)"',
+        ])
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            timeout=90, env={**os.environ, "EVENTS": events},
+        )
+
+    def test_a_successful_boot_is_silent(self):
+        # Anything the watchdog printed here would land on the agent's TUI and
+        # corrupt it, so success must produce no output at all.
+        result = self._harness(state_after=20, limit=180)
+        self.assertEqual(result.stderr, "", result.stderr)
+
+    def test_a_successful_boot_records_its_duration(self):
+        result = self._harness(state_after=20, limit=180)
+        self.assertIn("MARKER=ok", result.stdout)
+        self.assertIn("boot_s=20", result.stdout)
+        self.assertIn("removed=0", result.stdout)
+
+    def test_a_slow_boot_under_the_limit_is_not_an_error(self):
+        # The limit must be generous enough for a real first VM boot.
+        result = self._harness(state_after=75, limit=180)
+        self.assertIn("MARKER=ok", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_guest_that_never_boots_is_reported_and_unblocked(self):
+        result = self._harness(state_after=9999, limit=30)
+        self.assertIn("MARKER=failed", result.stdout)
+        # Removing the container is the whole point: it is what lets the
+        # foreground attach return instead of hanging forever.
+        self.assertIn("removed=1", result.stdout)
+        self.assertIn("has not reached 'running'", result.stderr)
+        self.assertIn("journalctl -u containerd", result.stderr)
+
+    def test_an_early_agent_exit_is_not_reported_as_a_failed_boot(self):
+        # With --rm the container is gone the moment the agent exits. That is
+        # an ordinary session end, not a VM that failed to boot.
+        result = self._harness(state_after=9999, limit=180, removed=True)
+        self.assertIn("MARKER=ok", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_the_marker_is_not_empty(self):
+        # The foreground path tests the marker with -s. An empty `: >` marker
+        # reads as "no failure", which restores the original silent hang --
+        # this caught exactly that during development.
+        body = function_body(CLI, "guest_boot_watchdog")
+        self.assertNotIn(': >"$GUEST_BOOT_MARKER"', body)
+        self.assertIn('>"$GUEST_BOOT_MARKER"', body)
+        result = self._harness(state_after=9999, limit=30)
+        self.assertIn("MARKER=failed", result.stdout)
+
+    def test_teardown_stops_the_watchdog(self):
+        # A watchdog outliving the session would remove containers and print
+        # diagnostics out of context during the NEXT session.
+        body = function_body(CLI, "teardown_session")
+        self.assertIn("GUEST_WATCHDOG_PID", body)
+        # And its scratch files must not accumulate in /tmp, one pair per session.
+        self.assertIn("GUEST_BOOT_MARKER", body)
+        self.assertIn("GUEST_BOOT_SECONDS_FILE", body)
+
+    def test_the_failure_path_uses_if_blocks_not_bare_and_lists(self):
+        # The CLI runs under `set -euo pipefail`. A bare `[[ cond ]] && assign`
+        # is exempt from set -e only by a subtlety of list semantics, and the
+        # whole file uses `if` everywhere else -- on the path whose failure we
+        # are trying to report, that is not a subtlety worth relying on.
+        body = function_body(CLI, "cmd_opencode")
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[[") and "]] &&" in stripped:
+                self.fail("bare &&-list in cmd_opencode under set -e: %s" % stripped)
+
+    def test_the_wait_is_explained_before_the_attach(self):
+        # The silence is inherent; being told so is the difference between
+        # "booting" and "broken".
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("SECUREAI_GUEST_BOOT_TIMEOUT", body)
+        self.assertIn("stays blank", body)
+
+    def test_the_session_is_closed_rather_than_left_hanging(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("guest_never_started", body)
+        self.assertIn("die \"The Kata guest VM never started", body)
 
     def test_selinux_label_is_asserted_with_ls_Z_not_assumed(self):
         source = read(INSTALLER)

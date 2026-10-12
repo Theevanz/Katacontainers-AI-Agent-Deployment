@@ -71,7 +71,8 @@ are implemented as runnable code, but they cannot be *executed* on this host (se
 
 **Always:**
 - `install-fedora.sh` is the **only** writer of `/etc/docker/daemon.json`; it registers one runtime
-  named `kata` with `runtimeType: containerd-shim-kata-v2` and leaves `default-runtime` absent.
+  named `kata` with `runtimeType: io.containerd.kata.v2` — the containerd runtime **class**, which
+  Docker resolves to the `containerd-shim-kata-v2` binary — and leaves `default-runtime` absent.
   `features.time-namespaces: false` is written **only** when Docker ≥ 29.5.0.
 - `proxy` service declares `runtime: runc` explicitly; `opencode` declares `runtime: kata`.
   The CLI passes **no** `--runtime` flag anywhere.

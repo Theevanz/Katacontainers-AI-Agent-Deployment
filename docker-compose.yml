@@ -45,13 +45,12 @@ services:
       SECUREAI_CONFIG_DIR: /config
       SECUREAI_PLACEHOLDER_KEY: ${SECUREAI_PLACEHOLDER_KEY}
     volumes:
-      # :z because two services consume this path (proxy + opencode). A private
-      # :Z here would relabel on the second mount and break the first (AD-7).
-      - ${SECUREAI_VAR_DIR}:/config:z:ro
-      # The proxy owns its CA directory. :Z because this container is the ONLY
-      # consumer -- :z would relabel the shared /config parent underneath the
-      # other consumer. It is a sub-mount, so it stays inside the :z group of
-      # the directory above it and does not disturb it.
+      # :Z -- the proxy is the ONLY consumer of /config now that the guest
+      # mount is removed (AD-7, AD-13). No other service may read keys.
+      # Mode is ro,Z (comma form): read-only plus private label.
+      - ${SECUREAI_VAR_DIR}:/config:ro,Z
+      # The proxy owns its CA directory. :Z -- single consumer, same container.
+      # Writable: mitmproxy must persist its keypair across restarts (AD-12).
       - ${SECUREAI_CA_DIR}:/config/ca:Z
     networks:
       secureai_net:
@@ -102,6 +101,9 @@ services:
       # out and never travels back into the guest (AD-1, AD-10).
       ANTHROPIC_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
       OPENAI_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+      # No OPENCODE_API_KEY here on purpose: Zen free models are used
+      # anonymously, and any placeholder Bearer would turn anonymous calls
+      # into `Invalid credential` rejections upstream.
       HTTPS_PROXY: http://${SECUREAI_PROXY_IP}:${SECUREAI_PROXY_PORT}
       HTTP_PROXY: http://${SECUREAI_PROXY_IP}:${SECUREAI_PROXY_PORT}
       # Required: without it the TUI's loopback server call routes back
@@ -114,19 +116,20 @@ services:
       XDG_CACHE_HOME: /home/node/.cache
       XDG_STATE_HOME: /home/node/.local/state
     volumes:
-      # Session workspace is the only writable guest path; :Z (single consumer).
+      # Session workspace is the only guest path. No /config mount: the guest
+      # must never see keys or the CA private key (AD-1, AD-12, NFR1).
       - ${SECUREAI_WORKSPACE}:/home/node/.local/share/opencode:Z
-      # Read-only config the guest never needs; :z (shared with proxy).
-      - ${SECUREAI_VAR_DIR}:/config:z:ro
     networks:
       secureai_net:
         ipv4_address: ${SECUREAI_OPENCODE_IP}
-    # AD-5: upstream name resolution is guest-local and carries no enforcement
-    # meaning. Docker's embedded resolver does NOT exist inside a Kata VM, so the
-    # guest's DNS points at the bridge gateway instead (kata#6688). This is a
+    # AD-5: upstream resolution is guest-local and carries no enforcement
+    # meaning. Docker's embedded resolver does NOT exist inside a Kata VM
+    # (kata#6688), and the bridge gateway runs no DNS, so the guest
+    # uses public resolvers directly. DNS is NOT mediated by the proxy.
     # SERVICE-level key -- inside the service, not under the network mapping.
     dns:
-      - ${SECUREAI_GATEWAY}
+      - 1.1.1.1
+      - 8.8.8.8
 
 networks:
   secureai_net:

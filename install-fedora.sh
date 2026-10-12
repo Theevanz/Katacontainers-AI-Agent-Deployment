@@ -210,6 +210,114 @@ docker_version_key() {
 #   Docker <= 28.5.2 -> the flag must NOT be written at all.
 readonly SECUREAI_TIME_NS_MIN_KEY=2950
 
+# =========================================================================
+# Kata's GUEST kernel and initrd.
+#
+# These live in /var/cache/kata-containers/ and are produced by
+# kata-osbuilder-generate.service, which Fedora ships DISABLED. The
+# configuration.toml points at them unconditionally, so a host that never ran
+# the generator installs cleanly, builds both images, starts the proxy -- and
+# then fails the moment a Kata container is created:
+#
+#   NotFound: failed to create shim task:
+#   /usr/share/kata-containers/defaults/configuration.toml:
+#   file /var/cache/kata-containers/vmlinuz.container does not exist
+#
+# The paths are READ from the configuration, never hard-coded: a Fedora that
+# ships them somewhere else is handled without a guess. Relative values are
+# skipped because Kata resolves those against its own runtime path.
+# =========================================================================
+kata_guest_assets() {
+  local cfg="$1" key value
+  [[ -r "$cfg" ]] || return 0
+  for key in kernel image; do
+    value="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\1/p" \
+             "$cfg" 2>/dev/null | head -1)"
+    [[ -n "$value" && "$value" == /* ]] || continue
+    printf '%s\n' "$value"
+  done
+}
+
+# Prints the asset paths that are absent, one per line. Empty output means the
+# guest can boot.
+kata_missing_assets() {
+  local cfg="$1" path
+  while read -r path; do
+    [[ -n "$path" && -e "$path" ]] || printf '%s\n' "$path"
+  done < <(kata_guest_assets "$cfg")
+}
+
+ensure_kata_guest_assets() {
+  local cfg="${1:-${SECUREAI_KATA_CONFIG_PATH:-}}"
+  [[ -n "$cfg" && -r "$cfg" ]] || {
+    warn "no Kata runtime config to read guest assets from; skipping."
+    return 0
+  }
+
+  local assets missing
+  assets="$(kata_guest_assets "$cfg")"
+  [[ -n "$assets" ]] || {
+    ok "Kata's config declares no absolute kernel/image paths"
+    return 0
+  }
+  missing="$(kata_missing_assets "$cfg")"
+  if [[ -z "$missing" ]]; then
+    ok "Kata guest kernel and initrd are present"
+    return 0
+  fi
+
+  log "Kata's guest kernel/initrd are missing -- building them now"
+  printf '    missing: %s\n' "${missing//$'\n'/ }"
+
+  # The generator unit is the supported way to produce these artifacts. With no
+  # producer on the host, waiting would only burn time before the same failure,
+  # so that case dies immediately and names the unit.
+  if ! systemctl cat kata-osbuilder-generate.service >/dev/null 2>&1; then
+    die "Kata's guest kernel/initrd are missing and this host has no
+ kata-osbuilder-generate.service to build them:
+   ${missing//$'\n'/ }
+ Kata points at these paths unconditionally, so every session would fail with
+ 'does not exist' before the VM ever boots. Nothing has been configured further.
+ If this Fedora packages Kata without the generator, build the assets another
+ way and re-run, or point ConfigPath at a Kata config whose kernel/image exist."
+  fi
+
+  # A oneshot, so `restart` blocks until the build finishes.
+  systemctl restart kata-osbuilder-generate.service \
+    || warn "kata-osbuilder-generate.service reported a failure; see:
+     journalctl -u kata-osbuilder-generate -b --no-pager"
+
+  # The unit can return before the artifacts are visible and a large initrd
+  # takes minutes to build, so the wait is on the FILES, not on the unit -- but
+  # it gives up as soon as the unit is no longer running, because nothing else
+  # is going to create them.
+  local waited=0
+  while (( waited < 300 )); do
+    missing="$(kata_missing_assets "$cfg")"
+    [[ -z "$missing" ]] && break
+    if (( waited >= 20 )) \
+       && ! systemctl is-active --quiet kata-osbuilder-generate.service \
+       && ! systemctl is-active --quiet kata-osbuilder-generate \
+       ; then
+      break
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+  done
+
+  missing="$(kata_missing_assets "$cfg")"
+  [[ -z "$missing" ]] || die \
+"Kata's guest kernel/initrd are still missing after ${waited}s:
+   ${missing//$'\n'/ }
+ Every session would fail with 'does not exist' before Kata ever boots.
+ Build them by hand, then re-run:
+   systemctl restart kata-osbuilder-generate.service
+   ls -l /var/cache/kata-containers/
+ If the unit itself fails, the cause is in:
+   journalctl -u kata-osbuilder-generate -b --no-pager"
+  ok "Kata guest kernel and initrd built"
+}
+
 write_daemon_json() {
   log "Registering the Kata runtime in ${SECUREAI_DAEMON_JSON}"
 
@@ -285,11 +393,20 @@ with open(path, "r", encoding="utf-8") as fh:
 if not isinstance(cfg, dict):
     cfg = {}
 
-# The one runtime we register. `kata-qemu` is a NAME (hypervisor config
-# basename), never an executable path -- Docker points at the containerd shim.
+# The one runtime we register.
+#
+# `runtimeType` must be the containerd RUNTIME CLASS, not the shim binary.
+# Docker resolves a shim-v2 class `io.containerd.<name>.v2` to the binary
+# `containerd-shim-<name>-v2`, so the class below resolves to
+# containerd-shim-kata-v2. Passing the binary name directly fails at session
+# start with:
+#   failed to resolve runtime path: invalid runtime name containerd-shim-kata-v2,
+#   correct runtime name should be either format like `io.containerd.runc.v2`
+#   or a full path to the binary
+# `kata-qemu` is likewise a NAME (hypervisor config basename), never a path.
 cfg["runtimes"] = {
     "kata": {
-        "runtimeType": "containerd-shim-kata-v2",
+        "runtimeType": "io.containerd.kata.v2",
         "options": {"ConfigPath": kata_config},
     }
 }
@@ -321,6 +438,14 @@ PY
     die "daemon.json contains default-runtime. This would move the key-holding
      proxy into the Kata VM and destroy the trust boundary. Refusing to continue."
   fi
+  # The runtime class form is what Docker accepts for a shim v2 runtime; the
+  # bare shim binary name is rejected at container start, long after the
+  # installer would have called itself done.
+  grep -q '"runtimeType"[[:space:]]*:[[:space:]]*"io.containerd.kata.v2"' \
+    "$SECUREAI_DAEMON_JSON" \
+    || die "daemon.json does not declare runtimeType io.containerd.kata.v2.
+     Docker resolves that class to the containerd-shim-kata-v2 binary; passing
+     the binary name itself is rejected as an invalid runtime name."
   ok "kata runtime registered, default-runtime absent"
 
   # Restart so the new configuration is actually loaded. Skipping this is why an
@@ -328,6 +453,16 @@ PY
   if systemctl is-active --quiet docker; then
     systemctl restart docker || warn "could not restart docker; run 'systemctl restart docker'."
   fi
+
+  # Observe what Docker actually loaded, rather than what we intended to write.
+  # This is the check that would have caught the runtimeType bug at install time
+  # instead of at first session.
+  local loaded
+  loaded="$(docker info --format '{{json .Runtimes}}' 2>/dev/null || echo "{}")"
+  grep -q '"kata"' <<<"$loaded" \
+    || warn "Docker does not report a kata runtime after the restart
+     (Runtimes: ${loaded}). If a session fails with 'invalid runtime name',
+     confirm daemon.json and: systemctl restart docker"
 }
 
 # =========================================================================
@@ -514,6 +649,7 @@ main() {
   check_preconditions
   install_packages
   write_daemon_json
+  ensure_kata_guest_assets "${SECUREAI_KATA_CONFIG_PATH:-}"
   install_layout
   label_paths
   verify_install

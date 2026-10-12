@@ -28,8 +28,9 @@ This document provides the complete epic and story breakdown for SecureAI (Kata-
 FR1:  A one-shot installer invoked as root on Fedora installs Kata Containers, Docker Engine, Docker Compose v2, and the SecureAI CLI to /usr/local/bin/secureai; installs the application tree machine-wide at /opt/secureai; and creates /etc/secureai (0700) and /var/lib/secureai (0700). The install is root-owned and machine-wide — no per-user variant, no checkout dependency (AD-16).
 FR1b: Every absolute path used at runtime by a compose bind mount or by the CLI is one of the five installed paths (/usr/local/bin/secureai, /opt/secureai, /etc/secureai, /var/lib/secureai, and the derived workspace under /var/lib/secureai). The repository checkout is never referenced at runtime (AD-16).
 FR2:  The installer asserts rather than assumes its prerequisites: root/sudo, Fedora 43 or 44, nested virtualization enabled, and a Docker/Kata version pair compatible with the Kata runtime. It fails with a readable message rather than proceeding on a bad host.
-FR3:  install-fedora.sh is the ONLY writer of /etc/docker/daemon.json. It registers exactly one runtime named `kata` pointing at containerd-shim-kata-v2 with ConfigPath under the runtime's options, and leaves `default-runtime` untouched.
+FR3:  install-fedora.sh is the ONLY writer of /etc/docker/daemon.json. It registers exactly one runtime named `kata` with `runtimeType: io.containerd.kata.v2` (the containerd runtime CLASS, which Docker resolves to the containerd-shim-kata-v2 binary) and ConfigPath under the runtime's options, and leaves `default-runtime` untouched.
 FR4:  The installer writes `features.time-namespaces: false` into daemon.json ONLY when Docker >= 29.5.0 (below 29.5 the flag is not written). Docker 29.5+ without the flag breaks Kata with `invalid namespace type` (kata#13080).
+FR4b: The installer treats Kata's GUEST kernel and initrd as a precondition: it reads the `kernel`/`image` paths from the Kata config it just wired, builds them via kata-osbuilder-generate.service if absent, and asserts they exist. The CLI re-asserts them before every session, because they symlink into /lib/modules/<running-kernel> and dangle after a kernel update. Absence must be reported by name, not surface as `vmlinuz.container does not exist` from the shim.
 FR5:  The installer relabels /etc/secureai and /var/lib/secureai using `semanage fcontext -a -t container_file_t` followed by `restorecon`, asserts the result with `ls -Z`, and warns-but-continues when SELinux is permissive or disabled.
 FR6:  OpenCode runs inside a Kata Containers VM using the `kata` runtime declared on the compose `opencode` service. Exactly one artifact declares the opencode runtime — docker-compose.yml — and the CLI passes no `--runtime` flag.
 FR7:  The forward proxy runs in a container explicitly pinned to `runtime: runc`, so the key-holding process never enters the Kata VM. The installer asserts this pin.
@@ -41,7 +42,7 @@ FR12: The proxy enforces an egress whitelist by validating SNI/Host against the 
 FR13: Enforcement gates on transport scheme as well as SNI/Host, so plaintext `http://` egress is also gated. Until this is designed, scheme `http` is an unguarded path.
 FR14: The proxy fails closed: unknown host, unreadable config, unparseable config, or missing key for an allowlisted host yields 403, never passthrough.
 FR15: `tls_clienthello` reads SNI for policy and logging and takes NO action. All enforcement acts at `requestheaders` via `http.Response.make(403)`. One addon class holds all three hooks; addon instance attributes are process-global and never carry per-flow request state (per-flow state lives in `flow.metadata`).
-FR16: Responses whose content-type is `text/event-stream` are streamed — `.stream = True` is set in `responseheaders` BEFORE any body is read — so LLM token streams emit instead of buffering until opencode's timeout. A response whose request headers were rewritten is never streamed.
+FR16: Responses whose content-type is `text/event-stream` are streamed — `.stream = True` is set in `responseheaders` BEFORE any body is read — so LLM token streams emit instead of buffering until opencode's timeout. A response whose body must be rewritten is never streamed.
 FR17: The mitmproxy CA is installed into the guest SYSTEM trust store (/usr/local/share/ca-certificates/ + update-ca-certificates) at image build. SSL_CERT_FILE / REQUESTS_CA_BUNDLE / GIT_SSL_CAINFO are either unset or point at a CONCATENATED bundle, never at the mitm CA alone. Only the public cert reaches the guest; the private key never leaves the proxy.
 FR18: The guest reaches the proxy at a fixed literal IP, not by DNS: the guest env carries `HTTPS_PROXY=http://${SECUREAI_PROXY_IP}:${SECUREAI_PROXY_PORT}`. Docker's embedded resolver (nameserver 127.0.0.11) does not exist inside the Kata VM and must not be relied on.
 FR19: docker-compose.yml sets `dns:` on the opencode service to the bridge gateway, and opencode/Dockerfile does NOT bake /etc/resolv.conf. Upstream name resolution is guest-local and carries no enforcement meaning — SNI is the enforcement signal.
@@ -86,7 +87,7 @@ NFR8:  UX — `secureai opencode` takes the user directly into OpenCode (interac
 NFR9:  SELinux — All bind mounts carry labels on an enforcing Fedora host; no permission-denied errors. The PRD's "all bind mounts use :Z" is AMENDED to :Z/:z by consumer count.
 NFR10: Maintainability — Minimal custom code: bash CLI, standard Docker Compose, one addon file.
 NFR11: Portability — Fedora 43 or 44 only. Multi-platform support is a PRD non-goal; the installer targets the platform rather than degrading on others.
-NFR12: Compatibility — Version matrix is one row, not a disjunction: Docker <= 28.5.2, or >= 29.5.0 with `features.time-namespaces: false`. Kata 3.25.0 (F43) / 3.26.0 (F44), Go runtime. `kata-qemu` is a NAME, not an executable; Docker points at containerd-shim-kata-v2.
+NFR12: Compatibility — Version matrix is one row, not a disjunction: Docker <= 28.5.2, or >= 29.5.0 with `features.time-namespaces: false`. Kata 3.25.0 (F43) / 3.26.0 (F44), Go runtime. `kata-qemu` is a NAME, not an executable; Docker is given the runtime class `io.containerd.kata.v2`, which it resolves to containerd-shim-kata-v2.
 NFR13: Observability — mitmproxy runs with `--set flow_detail=0` and `-q`. One line per blocked flow carrying host, scheme, and decision. The addon never logs header values. Injection is logged as a fingerprint only.
 NFR14: Quality bar — Showcase proof of concept, not production-hardened. Automated tests/CI, upgrade/migration paths, multi-user key management, performance tuning, and comprehensive documentation are explicitly out of MVP scope.
 NFR15: Config integrity — One writer, one read path: the CLI is the only writer of /etc/secureai; the proxy mounts config read-only and never writes it. The addon re-reads config per flow and fails closed.
@@ -390,12 +391,13 @@ So that the agent runs in a VM and the key-holding proxy is never drawn into it.
 
 **Given** a clean install
 **When** I inspect `/etc/docker/daemon.json`
-**Then** it declares exactly one runtime named `kata`, with `runtimeType: containerd-shim-kata-v2` and `ConfigPath` under that runtime's options
+**Then** it declares exactly one runtime named `kata`, with `runtimeType: io.containerd.kata.v2` (the containerd runtime class, which Docker resolves to the containerd-shim-kata-v2 binary — the bare shim binary name is rejected as an invalid runtime name) and `ConfigPath` under that runtime's options
 **And** `default-runtime` is **absent** — left at Docker's own default, never set to `kata` (AD-6)
 **And** the CLI passes no `--runtime` flag anywhere, and the opencode runtime is declared only in `docker-compose.yml`
 **And** the CLI asserts that the `proxy` service declares `runtime: runc` explicitly before starting a session
 **And** no second artifact — the CLI, a compose override, or a script — writes `daemon.json`
 **And** `kata-qemu` is treated as a runtime **name**, never invoked as an executable path
+**And** the `kernel`/`image` paths in that Kata config are asserted to exist after the install, with `kata-osbuilder-generate.service` run to produce them if absent
 
 ### Story 1.4: Docker 29.5+ time-namespaces conditional
 
@@ -468,7 +470,7 @@ So that the agent works without discovering dependencies at runtime.
 **And** provider SDK binaries opencode would otherwise install at runtime into `~/.cache/opencode/bin` are **pre-seeded at build**, so a runtime-discovered dependency fails the build rather than widening the allowlist
 **And** the guest env carries `HTTPS_PROXY=http://${SECUREAI_PROXY_IP}:${SECUREAI_PROXY_PORT}` sourced from `compose.env`, never a compose service name (AD-5)
 **And** `NO_PROXY=localhost,127.0.0.1,::1` is set in the guest env
-**And** `docker-compose.yml` sets `dns:` on the opencode service to the bridge gateway, and `opencode/Dockerfile` does not bake `/etc/resolv.conf`
+**And** `docker-compose.yml` sets `dns:` on the opencode service to public resolvers (the bridge gateway runs no DNS), and `opencode/Dockerfile` does not bake `/etc/resolv.conf`
 **And** no Docker embedded resolver address (`127.0.0.11`) is referenced anywhere in the tree
 **And** `/etc/secureai/compose.env` (0640 root) is the sole source of `SECUREAI_SUBNET`, `SECUREAI_GATEWAY`, `SECUREAI_PROXY_IP`, `SECUREAI_PROXY_PORT`, and `SECUREAI_PLACEHOLDER_KEY`; every other reference is `${...}`, and no literal copy of any of the five exists outside that file (AD-11)
 **And** the CLI is bash throughout — `yq` is not used and no new language dependency is introduced (FR43)
