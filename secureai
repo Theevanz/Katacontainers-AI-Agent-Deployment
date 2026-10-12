@@ -629,6 +629,23 @@ cmd_opencode() {
      if you have not built since exporting a CA, interception will fail closed."
   fi
 
+  # A session killed mid-flight (power loss, SIGKILL) leaves containers holding
+  # these two names, and the next session then dies on a name conflict instead
+  # of starting. Neither name belongs to anything but this session -- and a
+  # leftover proxy holds the real keys, so it is exactly what must not survive
+  # (AD-14). Cleared before the traps are armed so a failure here is a message,
+  # not an orphaned container.
+  local stale
+  for stale in "$SECUREAI_PROXY_CONTAINER" "$SECUREAI_OPENCODE_CONTAINER"; do
+    if docker inspect "$stale" >/dev/null 2>&1; then
+      docker rm -f "$stale" >/dev/null 2>&1 || die \
+"A leftover container named '${stale}' could not be removed, so this session
+ cannot claim the name. Remove it by hand, then re-run:
+   sudo docker rm -f ${stale}"
+      ok "removed a leftover '${stale}' from a previous session"
+    fi
+  done
+
   # The trap must also cover EXIT and HUP: a closed terminal or an unhandled
   # signal must not leave the proxy (which holds the real keys) running.
   trap teardown_session EXIT
@@ -700,10 +717,14 @@ cmd_opencode() {
 
   SESSION_ACTIVE=1
   log "Starting OpenCode inside the Kata VM"
+  # --no-deps: the proxy is already up and health-gated above, and letting
+  # compose start it again would collide with the container just created under
+  # that same name. The health contract is not weakened -- this loop enforced
+  # it, more precisely than compose's `depends_on` could.
   # -it lands the user INSIDE the agent. No runtime-override flag, ever (AD-6).
   # The exit status is the agent's own; a non-zero exit is reported, not hidden.
   local rc=0
-  compose run --rm -it --name "$SECUREAI_OPENCODE_CONTAINER" opencode || rc=$?
+  compose run --rm --no-deps -it --name "$SECUREAI_OPENCODE_CONTAINER" opencode || rc=$?
 
   local session_end_s="$SECONDS"
   # Story 4.4: the time-to-ready number, decomposed, and recorded against the

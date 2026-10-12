@@ -391,6 +391,31 @@ class TestCliSessionAndGates(unittest.TestCase):
         self.assertIn("timeout: 5s", read(COMPOSE))
         self.assertIn("condition: service_healthy", read(COMPOSE))
 
+    def test_guest_run_does_not_restart_the_health_gated_proxy(self):
+        # `compose run` starts the target service's dependencies unless it is
+        # told not to, and the proxy was already created by hand with the same
+        # container name -- so compose's attempt to start it collides with it
+        # ("The container name /secureai-proxy is already in use").
+        body = function_body(CLI, "cmd_opencode")
+        guest_run_idx = body.index('opencode || rc=$?')
+        guest_run = body[guest_run_idx - 400:guest_run_idx]
+        self.assertIn("--no-deps", guest_run,
+                      "the guest run must pass --no-deps; the CLI has already "
+                      "started and health-gated the proxy itself")
+
+    def test_session_start_removes_leftover_containers_first(self):
+        # A session killed mid-flight (power loss, SIGKILL) leaves containers
+        # holding these names, and the next session then dies on a name
+        # conflict. Nothing else may hold them: the proxy holds the real keys.
+        body = function_body(CLI, "cmd_opencode")
+        # Anchor on the first EXECUTED compose run, not on the earlier comment
+        # that merely mentions `compose run`.
+        head = body[:body.index("compose run --rm")]
+        for name in ('"$SECUREAI_PROXY_CONTAINER"', '"$SECUREAI_OPENCODE_CONTAINER"'):
+            self.assertIn(name, head)
+        self.assertIn("docker rm -f", head,
+                      "leftovers must be cleared before the first compose run")
+
     def test_teardown_trap_on_int_and_term_and_no_systemd_unit(self):
         source = read(CLI)
         # The word "systemd" must appear only in comments, never in live code
