@@ -19,3 +19,21 @@
     "container_file_t", so the warning fires even when the type is correct.
     Observed live in the user's install transcript on Fedora 44. Warn-only,
     no functional impact; the fix is to compare field 3 of the context.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-addon-unreadable-in-image.md`
+  summary: The guest image bakes payload files from the build context the same way the proxy did.
+  evidence: >-
+    opencode/Dockerfile COPYs opencode/opencode.json, opencode/models.json and
+    ca.pem from the build context. The proxy's equivalent COPY is what made
+    addon.py unreadable on an SELinux + containerd-store host (see
+    spec-fix-addon-unreadable-in-image.md), so the same class of failure is
+    plausible for the guest image. It has never been exercised -- the session
+    never got past proxy startup -- so there is no evidence either way and no
+    speculative fix was made.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-addon-unreadable-in-image.md`
+  summary: RESOLVED -- the spurious SELinux label warning recorded above.
+  evidence: >-
+    Fixed alongside the /opt/secureai labeling: the assertion now compares the
+    context's type field (cut -d: -f3) instead of the whole context string, so
+    a correctly labelled host no longer warns.

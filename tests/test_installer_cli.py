@@ -231,6 +231,35 @@ class TestInstallerRuntimeWiring(unittest.TestCase):
         # Permissive/disabled warns and continues rather than failing.
         self.assertIn("not Enforcing", source)
 
+    def test_label_assertion_compares_the_type_not_the_whole_context(self):
+        # `ls -Zd` field 1 is the full context
+        # (system_u:object_r:container_file_t:s0), which can never equal the
+        # bare type string -- so comparing it to "container_file_t" warned on
+        # every correctly labelled host. Field 3 is the type.
+        body = function_body(INSTALLER, "label_paths")
+        self.assertIn("cut -d: -f3", body)
+        self.assertIn("!= \"container_file_t\"", body)
+
+    def test_installer_labels_the_app_tree_container_file_t(self):
+        # The tree in /opt/secureai is the build context for BOTH images, so
+        # every payload file baked into an image originates here. Left at the
+        # default /opt label it is not container-readable.
+        body = function_body(INSTALLER, "label_paths")
+        self.assertIn("SECUREAI_APP_DIR", body)
+
+    def test_proxy_addon_is_created_in_a_layer_not_copied_into_the_image(self):
+        # A file copied from a build context can carry that context's SELinux
+        # label into the image layer (containerd image store preserves xattrs),
+        # and a container_t process cannot getattr such a file -- mitmproxy
+        # reports that as "No such script" because os.path.isfile returns False
+        # on EACCES. Writing the file inside a RUN gives it the image's own
+        # context label instead.
+        dockerfile = read(os.path.join(REPO_ROOT, "proxy", "Dockerfile"))
+        self.assertNotIn("COPY --chmod=0644 proxy/addon.py /opt/secureai/addon.py", dockerfile,
+                         "the addon must be written by a RUN, not copied into the image")
+        self.assertIn("/opt/secureai/addon.py", dockerfile)
+        self.assertIn("install -m 0644", dockerfile)
+
     def test_idempotent_rerun_does_not_fail_on_existing_state(self):
         """Matrix row 3. Structural: -a then -m is idempotent without deleting."""
         body = function_body(INSTALLER, "label_paths")

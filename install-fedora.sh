@@ -464,7 +464,7 @@ label_paths() {
      Install policycoreutils-python-utils and re-run."
 
   local path
-  for path in "$SECUREAI_ETC" "$SECUREAI_VAR"; do
+  for path in "$SECUREAI_ETC" "$SECUREAI_VAR" "$SECUREAI_APP_DIR"; do
     # `-a` fails when the definition already exists, and `-m` fails when it does
     # not. Trying `-a` then `-m` is idempotent WITHOUT the delete-first dance,
     # which briefly leaves the path with no fcontext at all if the re-add fails.
@@ -477,9 +477,12 @@ label_paths() {
 
   # AD-7: assert the resulting label. A zero exit from semanage does not mean
   # the label landed; `ls -Z` is the observation that counts.
-  for path in "$SECUREAI_ETC" "$SECUREAI_VAR"; do
+  for path in "$SECUREAI_ETC" "$SECUREAI_VAR" "$SECUREAI_APP_DIR"; do
     local label
-    label="$(ls -Zd "$path" 2>/dev/null | awk '{print $1}' || true)"
+    # Field 1 of `ls -Z` is the whole context
+    # (system_u:object_r:container_file_t:s0), which can never equal the bare
+    # type; field 3 is the type, which is what is being asserted here.
+    label="$(ls -Zd "$path" 2>/dev/null | awk '{print $1}' | cut -d: -f3 || true)"
     if [[ "$label" != "container_file_t" ]]; then
       warn "${path} carries '${label:-unknown}', expected container_file_t.
      If a bind mount is later refused with 'permission denied', inspect

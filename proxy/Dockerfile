@@ -23,7 +23,17 @@ RUN pip install --no-cache-dir pyyaml
 # The entrypoint gosu-drops to the unprivileged `mitmproxy` user and forces
 # HOME=/home/mitmproxy. So the addon must be world-readable or the drop fails
 # with a permission error that looks like a broken proxy (Story 2.3).
-COPY --chmod=0644 proxy/addon.py /opt/secureai/addon.py
+#
+# Written by a RUN rather than copied straight to its final path on purpose: a
+# file copied from a build context can carry that context's SELinux label into
+# the image layer (the containerd image store preserves xattrs), and a
+# container_t process cannot even getattr such a file. mitmproxy then reports
+# it as "No such script", because os.path.isfile() returns False on EACCES.
+# A file created here gets the image's own context label instead.
+COPY proxy/addon.py /tmp/secureai-addon.py
+RUN install -d -m 0755 /opt/secureai \
+ && install -m 0644 /tmp/secureai-addon.py /opt/secureai/addon.py \
+ && rm -f /tmp/secureai-addon.py
 
 # NOTE: this Dockerfile deliberately does NOT re-map the `mitmproxy` user.
 # The upstream `docker-entrypoint.sh` is responsible for re-pinning that user's
