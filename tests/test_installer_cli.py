@@ -844,7 +844,7 @@ class TestGuestBootWatchdog(unittest.TestCase):
     to source matching.
     """
 
-    def _harness(self, state_after, limit, removed=False):
+    def _harness(self, state_after, limit, removed=False, qemu_count=1):
         events = tempfile.mktemp(suffix=".events")
         self.addCleanup(lambda: os.path.exists(events) and os.unlink(events))
         for suffix in (".marker", ".secs"):
@@ -875,7 +875,7 @@ class TestGuestBootWatchdog(unittest.TestCase):
             '  if [[ "$1" == "rm" ]]; then printf "REMOVED\\n" >>"$EVENTS"; fi',
             '  return 0',
             '}',
-            'pgrep() { printf "1\\n"; }',
+            'pgrep() { printf "%d\\n"; }' % qemu_count,
             'ls() { [[ "$1" == /run/vc/sandbox ]] && { printf "sandbox1\\n"; return 0; }; command ls "$@"; }',
             function_body(CLI, "guest_boot_diagnostics") + "\n}",
             function_body(CLI, "guest_boot_watchdog") + "\n}",
@@ -917,13 +917,112 @@ class TestGuestBootWatchdog(unittest.TestCase):
         self.assertIn("removed=1", result.stdout)
         self.assertIn("has not reached 'running'", result.stderr)
         self.assertIn("journalctl -u containerd", result.stderr)
+        self.assertIn("timeout 10 journalctl", result.stderr)
 
     def test_an_early_agent_exit_is_not_reported_as_a_failed_boot(self):
-        # With --rm the container is gone the moment the agent exits. That is
-        # an ordinary session end, not a VM that failed to boot.
-        result = self._harness(state_after=9999, limit=180, removed=True)
+        # With --rm the container is gone the moment the agent exits. A
+        # removal AFTER running was seen is an ordinary session end, not a VM
+        # that failed to boot -- so the stub serves running, then removal.
+        result = self._latch_harness(states=["created", "running", "REMOVED"],
+                                     limit=180)
         self.assertIn("MARKER=ok", result.stdout)
         self.assertEqual(result.stderr, "")
+
+    def test_clean_exit_after_running_keeps_its_boot_timing(self):
+        # The first-running time is the session-timing measurement; the later
+        # removal must not overwrite it with the exit time.
+        result = self._latch_harness(states=["created", "running", "REMOVED"],
+                                     limit=180)
+        self.assertIn("MARKER=ok", result.stdout)
+        self.assertIn("boot_s=10", result.stdout)
+        self.assertIn("removed=0", result.stdout)
+
+    def test_fast_qemu_exit_fails_fast_with_a_qemu_exit_line(self):
+        # Spec matrix row 1: QEMU gone in <10s, container still Created,
+        # running never seen -> fail fast with a QEMU-exit line, and rm -f
+        # unblocks the attach. Fast, not at the limit: the message names the
+        # 10s detection point, and no boot time is recorded.
+        result = self._harness(state_after=9999, limit=180, qemu_count=0)
+        self.assertIn("MARKER=failed", result.stdout)
+        self.assertIn("removed=1", result.stdout)
+        self.assertIn("QEMU", result.stderr)
+        self.assertIn("exited", result.stderr)
+        self.assertIn("after 10s", result.stderr)
+        self.assertIn("boot_s=none", result.stdout)
+
+    def test_exited_before_running_is_a_boot_failure(self):
+        result = self._latch_harness(states=["created", "exited"], limit=180)
+        self.assertIn("MARKER=failed", result.stdout)
+        self.assertIn("removed=1", result.stdout)
+        self.assertIn("QEMU", result.stderr)
+        self.assertIn("boot_s=none", result.stdout)
+
+    def test_dead_before_running_is_a_boot_failure(self):
+        result = self._latch_harness(states=["created", "dead"], limit=180)
+        self.assertIn("MARKER=failed", result.stdout)
+        self.assertIn("removed=1", result.stdout)
+        self.assertIn("QEMU", result.stderr)
+
+    def test_removed_before_running_is_a_boot_failure(self):
+        # The latch cuts the other way too: removed/empty with running never
+        # seen is a failed create, not a clean exit. An always-removed stub
+        # models a `compose run` that never produced a container.
+        result = self._latch_harness(states=["REMOVED"], limit=180)
+        self.assertIn("MARKER=failed", result.stdout)
+        self.assertIn("removed=1", result.stdout)
+        self.assertIn("QEMU", result.stderr)
+
+    def _latch_harness(self, states, limit, qemu_count=1):
+        """A sequence-driven docker stub for the never-saw-running latch.
+
+        Each `docker inspect` serves the next entry of `states` (the last
+        entry repeats); the entry REMOVED makes inspect fail, modelling --rm
+        removal. The SECONDS clock in _harness cannot express
+        running-then-removed, so the stub serves a sequence instead.
+        """
+        events = tempfile.mktemp(suffix=".events")
+        self.addCleanup(lambda: os.path.exists(events) and os.unlink(events))
+        for suffix in (".marker", ".secs", ".idx"):
+            path = events + suffix
+            self.addCleanup(lambda p=path: os.path.exists(p) and os.unlink(p))
+
+        script = "\n".join([
+            'warn() { printf " warn %s\n" "$*" >&2; }',
+            'timeout() { shift; "$@"; }',
+            'SECUREAI_OPENCODE_CONTAINER=secureai-opencode',
+            'kata_config_path() { printf "%%s\\n" /dev/null; }',
+            'SECONDS=0',
+            ': >"$EVENTS"',
+            'sleep() { SECONDS=$((SECONDS+5)); }',
+            'pgrep() { echo %d; }' % qemu_count,
+            'docker() {',
+            '  if [[ "$1" == "inspect" ]]; then',
+            '    idx="$(cat "$EVENTS.idx" 2>/dev/null || echo 0)";',
+            '    n="$(echo "$STATES_SEQ" | wc -w)";',
+            '    if (( idx >= n )); then idx=$(( n - 1 )); fi;',
+            '    s="$(echo "$STATES_SEQ" | cut -d" " -f$(( idx + 1 )))";',
+            '    echo "$(( idx + 1 ))" >"$EVENTS.idx";',
+            '    if [[ "$s" == "REMOVED" ]]; then return 1; fi;',
+            '    echo "$s"; return 0;',
+            '  fi',
+            '  if [[ "$1" == "rm" ]]; then echo REMOVED >>"$EVENTS"; fi',
+            '  return 0',
+            '}',
+            'ls() { [[ "$1" == /run/vc/sandbox ]] && { echo sandbox1; return 0; }; command ls "$@"; }',
+            function_body(CLI, "guest_boot_diagnostics") + "\n}",
+            function_body(CLI, "guest_boot_watchdog") + "\n}",
+            'GUEST_BOOT_MARKER="$EVENTS.marker"',
+            'GUEST_BOOT_SECONDS_FILE="$EVENTS.secs"',
+            'guest_boot_watchdog "%d"' % limit,
+            '[[ -s "$GUEST_BOOT_MARKER" ]] && echo MARKER=failed || echo MARKER=ok',
+            'echo "boot_s=$(cat "$GUEST_BOOT_SECONDS_FILE" 2>/dev/null || echo none)"',
+            'echo "removed=$(grep -c REMOVED "$EVENTS" || true)"',
+        ])
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            timeout=90, env={**os.environ, "EVENTS": events,
+                             "STATES_SEQ": " ".join(states)},
+        )
 
     def test_the_marker_is_not_empty(self):
         # The foreground path tests the marker with -s. An empty `: >` marker
@@ -1961,8 +2060,22 @@ class TestVmmDiagnosticsLines(unittest.TestCase):
     /run/vc/vm label and any recent VMM denial.
     """
 
-    def _run(self, avc_stdout="", avc_rc=0):
+    def _run(self, avc_stdout="", avc_rc=0, kata_cfg=None,
+             sel_mode="Enforcing"):
         body = function_body(CLI, "guest_boot_diagnostics") + "\n}"
+        # Fixture Kata config: the diagnostics read enable_debug/shared_fs /
+        # kernel / image via kata_config_path, so tests needing real values
+        # override the /dev/null stub below with a later definition (in bash
+        # the last function definition wins).
+        kata_override = ":"
+        if kata_cfg is not None:
+            fd, cfg_path = tempfile.mkstemp(suffix=".toml")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(kata_cfg)
+            self.addCleanup(os.unlink, cfg_path)
+            kata_override = 'kata_config_path() { echo "' + cfg_path + '"; }'
+        # SELinux mode override, same last-wins mechanism.
+        sel_override = 'getenforce() { echo "$STUB_SELMODE"; }'
         script = "\n".join([
             'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
             'ok()   { printf "ok: %s\\n" "$*"; }',
@@ -1982,6 +2095,8 @@ class TestVmmDiagnosticsLines(unittest.TestCase):
             'getenforce() { printf "Enforcing\\n"; }',
             'ausearch() { printf "%s" "$STUB_AVC"; return "$STUB_AVC_RC"; }',
             body,
+            kata_override,
+            sel_override,
             'guest_boot_diagnostics',
         ])
         vm_dir = tempfile.mkdtemp()
@@ -1989,7 +2104,7 @@ class TestVmmDiagnosticsLines(unittest.TestCase):
             vm_dir, ignore_errors=True))
         env = {**os.environ, "SECUREAI_KATA_VM_DIR": vm_dir,
                "STUB_VM_DIR": vm_dir, "STUB_AVC": avc_stdout,
-               "STUB_AVC_RC": str(avc_rc)}
+               "STUB_AVC_RC": str(avc_rc), "STUB_SELMODE": sel_mode}
         return subprocess.run(
             ["bash", "-c", script], capture_output=True, text=True,
             timeout=60, env=env,
@@ -2011,6 +2126,89 @@ class TestVmmDiagnosticsLines(unittest.TestCase):
         result = self._run(avc_stdout="<no matches>\n", avc_rc=1)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("recent VMM denials: none", result.stdout)
+
+    def test_reports_kata_config_and_vhost_lines(self):
+        # Spec acceptance: the new diagnostics fields are asserted, with the
+        # values parsed out of a fixture Kata config, not just the labels.
+        cfg = (
+            "[runtime]\n"
+            "  enable_debug = true\n"
+            "[hypervisor.qemu]\n"
+            '  kernel = "/var/cache/kata-containers/vmlinuz.container"\n'
+            '  image = "/var/cache/kata-containers/kata-initrd.img"\n'
+            '  shared_fs = "virtio-fs"\n'
+        )
+        result = self._run(kata_cfg=cfg)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("enable_debug", result.stdout)
+        self.assertIn("true", result.stdout)
+        self.assertIn("shared_fs", result.stdout)
+        self.assertIn("virtio-fs", result.stdout)
+        self.assertIn("vhost-vsock", result.stdout)
+        self.assertIn("guest kernel", result.stdout)
+        self.assertIn("/var/cache/kata-containers/vmlinuz.container",
+                      result.stdout)
+        self.assertIn("timeout 10 journalctl", result.stdout)
+
+    def test_permissive_mode_states_not_blocking(self):
+        # Spec matrix row 3: a non-Enforcing mode never blocks the boot, so
+        # the output says so and points at the console and config, not policy.
+        result = self._run(sel_mode="Permissive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not blocking", result.stdout)
+        self.assertIn("console", result.stdout)
+        self.assertIn("config", result.stdout)
+
+    def test_permissive_only_denials_state_not_blocking(self):
+        # permissive=1 AVCs record would-deny, not blocked: no policy grants
+        # may be built from them, so the output says SELinux is not blocking.
+        avc = ("type=AVC msg=audit(1): avc: denied { read } for pid=1 "
+               'comm="qemu-system-x8" permissive=1 '
+               "tcontext=system_u:object_r:vhost_device_t:s0 tclass=chr_file\n")
+        result = self._run(avc_stdout=avc, sel_mode="Permissive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("qemu-system-x8", result.stdout)
+        self.assertIn("not blocking", result.stdout)
+        self.assertIn("permissive", result.stdout)
+
+    def test_enforcing_denials_do_not_claim_not_blocking(self):
+        # The mirror: a real (non-permissive) denial on Enforcing must keep
+        # the plain denial listing with no not-blocking note.
+        avc = ("type=AVC msg=audit(1): avc: denied { read } for pid=1 "
+               'comm="qemu-system-x8" '
+               "tcontext=system_u:object_r:vhost_device_t:s0 tclass=chr_file\n")
+        result = self._run(avc_stdout=avc)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("qemu-system-x8", result.stdout)
+        self.assertNotIn("not blocking", result.stdout)
+
+    def test_unknown_sentinel_on_each_config_line(self):
+        # Default stub config (/dev/null) yields no values: each Kata config
+        # line must say "unknown" rather than print empty or guess.
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        for label in ("guest kernel", "guest image", "enable_debug",
+                      "shared_fs"):
+            matches = [line for line in lines if label in line]
+            self.assertEqual(len(matches), 1, "%s must print once" % label)
+            self.assertIn("unknown", matches[0])
+
+    def test_mixed_denials_do_not_claim_not_blocking(self):
+        # One permissive=1 line beside a real enforcing denial: the listing
+        # must show both, with no not-blocking note (a single enforcing
+        # denial means SELinux may be blocking).
+        avc = ("type=AVC msg=audit(1): avc: denied { read } for pid=1 "
+               'comm="qemu-enforcing" '
+               "tcontext=system_u:object_r:vhost_device_t:s0 tclass=chr_file\n"
+               "type=AVC msg=audit(1): avc: denied { read } for pid=2 "
+               'comm="qemu-permissive" permissive=1 '
+               "tcontext=system_u:object_r:vhost_device_t:s0 tclass=chr_file\n")
+        result = self._run(avc_stdout=avc)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("qemu-enforcing", result.stdout)
+        self.assertIn("qemu-permissive", result.stdout)
+        self.assertNotIn("not blocking", result.stdout)
 
 
 class TestStatusVmmBlock(unittest.TestCase):
@@ -2068,6 +2266,82 @@ class TestStatusVmmBlock(unittest.TestCase):
         self.assertIn("SELinux", result.stdout)
         self.assertIn("Enforcing", result.stdout)
         self.assertIn("kata AVCs (recent)", result.stdout)
+
+
+class TestWarnNestedKvm(unittest.TestCase):
+    """The per-session nested-KVM precheck warns only, never blocks.
+
+    EXECUTED against fixture /dev/kvm and cpuinfo paths: a missing node or
+    missing vmx/svm flags must warn on stderr yet exit 0, because boot
+    failures are owned by the watchdog, not by a heuristic refusal here.
+    """
+
+    def _run(self, kvm_exists=True, cpuinfo="flags : fpu vme vmx ss\n"):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        if kvm_exists:
+            kvm_path = os.path.join(tmp, "kvm")
+            with open(kvm_path, "w", encoding="utf-8") as fh:
+                fh.write("")
+        else:
+            kvm_path = os.path.join(tmp, "no-kvm")
+        cpu_path = os.path.join(tmp, "cpuinfo")
+        with open(cpu_path, "w", encoding="utf-8") as fh:
+            fh.write(cpuinfo)
+        body = function_body(CLI, "warn_kata_nested_kvm") + "\n}"
+        script = "\n".join([
+            'die()  { echo "DIE: $*" >&2; exit 1; }',
+            'warn() { echo "WARN: $*" >&2; }',
+            body,
+            'warn_kata_nested_kvm',
+        ])
+        env = {**os.environ, "SECUREAI_KVM_DEV": kvm_path,
+               "SECUREAI_CPUINFO": cpu_path}
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            timeout=30, env=env,
+        )
+
+    def test_healthy_host_is_silent_and_zero(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_kvm_warns_but_never_blocks(self):
+        result = self._run(kvm_exists=False)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("not present", result.stderr)
+
+    def test_missing_flags_warn_but_never_block(self):
+        result = self._run(cpuinfo="flags : fpu vme de pse\n")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("vmx/svm", result.stderr)
+
+    def test_check_never_dies(self):
+        body = function_body(CLI, "warn_kata_nested_kvm")
+        self.assertNotRegex(body, r"\bdie\b")
+
+    def test_opencode_runs_the_warn_only_check_after_the_asserts(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("warn_kata_nested_kvm", body)
+        self.assertLess(body.index("assert_kata_vmm_path"),
+                        body.index("warn_kata_nested_kvm"))
+
+
+class TestVmmPolicyRebuildNote(unittest.TestCase):
+    """The VMM rebuild runbook is document-only and Enforcing-scoped."""
+
+    def test_rebuild_runbook_names_enforcing_live_denials(self):
+        source = read(INSTALLER)
+        self.assertIn("audit2allow -M secureai-kata -i kata.avc", source)
+
+    def test_no_grants_from_permissive_denials(self):
+        body = function_body(INSTALLER, "ensure_kata_vmm_policy")
+        self.assertIn("permissive=1", body)
+        # Still Enforcing-gated, and enforcement is never relaxed.
+        self.assertIn('!= "Enforcing"', body)
+        self.assertNotIn("setenforce 0", read(INSTALLER))
 
 
 if __name__ == "__main__":

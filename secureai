@@ -793,6 +793,38 @@ assert_kata_vmm_path() {
   ok "${pid_dir} is ${vm_type}, mode ${mode_bits}"
 }
 
+# Warn-only nested-KVM precheck (spec-fix-secureai-kata-vm-boot-failure).
+#
+# Kata runs the guest as a real VM, so without /dev/kvm and a vmx/svm CPU
+# flag the guest cannot boot. The installer already dies on this before
+# touching the host; per-session this MUST NOT block -- a heuristic refusal
+# here would strand working hosts (e.g. a kvm node with masked cpuinfo), and
+# boot failures are owned by the watchdog + diagnostics below. So this only
+# warns. Paths are overridable so the check runs against fixtures in tests.
+# Always exits 0.
+SECUREAI_KVM_DEV="${SECUREAI_KVM_DEV:-/dev/kvm}"
+SECUREAI_CPUINFO="${SECUREAI_CPUINFO:-/proc/cpuinfo}"
+warn_kata_nested_kvm() {
+  local kvm_note=""
+  if [[ ! -e "${SECUREAI_KVM_DEV:-/dev/kvm}" ]]; then
+    kvm_note="${SECUREAI_KVM_DEV:-/dev/kvm} is not present"
+  fi
+  if ! grep -qwE '(vmx|svm)' "${SECUREAI_CPUINFO:-/proc/cpuinfo}" 2>/dev/null; then
+    if [[ -n "$kvm_note" ]]; then
+      kvm_note="${kvm_note}; no vmx/svm CPU flag in ${SECUREAI_CPUINFO:-/proc/cpuinfo}"
+    else
+      kvm_note="no vmx/svm CPU flag in ${SECUREAI_CPUINFO:-/proc/cpuinfo} (${SECUREAI_KVM_DEV:-/dev/kvm} exists)"
+    fi
+  fi
+  if [[ -n "$kvm_note" ]]; then
+    warn "Nested-KVM check: ${kvm_note}. A Kata VM needs hardware
+     virtualization (/dev/kvm plus a vmx/svm flag); without it the guest cannot
+     boot and the watchdog will report the failure. Continuing anyway -- this
+     check never blocks a session."
+  fi
+  return 0
+}
+
 # AD-14: the session is a pair. Both containers carry --rm, and a trap tears
 # the pair down on INT/TERM so nothing is orphaned. No systemd unit
 # auto-starts the proxy -- that would contradict per-session containment (F12).
@@ -829,14 +861,43 @@ GUEST_BOOT_SECONDS_FILE=""
 
 # What an operator needs when the VM did not come up. Each line is a fact they
 # would otherwise go and collect by hand.
+#
+# Read-only: the active Kata configuration.toml is never edited here, only
+# read (spec-fix-secureai-kata-vm-boot-failure). Every docker/journal probe
+# is wrapped in `timeout`; journalctl stays a printed pointer, never executed.
 guest_boot_diagnostics() {
-  local state qemu sandboxes kernel vm_label sel_mode avcs
+  local state qemu sandboxes kernel image enable_debug shared_fs kata_cfg
+  local vhost_vsock vm_label sel_mode avcs
   state="$(timeout 10 docker inspect --format '{{.State.Status}}' \
              "$SECUREAI_OPENCODE_CONTAINER" 2>/dev/null || echo removed)"
-  qemu="$(pgrep -c -f qemu-system 2>/dev/null || true)"
-  sandboxes="$(ls /run/vc/sandbox 2>/dev/null | tr '\n' ' ')"
-  kernel="$(sed -nE 's/^[[:space:]]*kernel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
-             "$(kata_config_path 2>/dev/null)" 2>/dev/null | head -1)"
+  qemu="$(timeout 10 pgrep -c -f qemu-system 2>/dev/null || true)"
+  sandboxes="$(timeout 10 ls /run/vc/sandbox 2>/dev/null | tr '\n' ' ')"
+  # Kata's own config, read once: kernel/image locate the guest assets while
+  # enable_debug/shared_fs explain a vsock-timeout boot (debug off and an
+  # unexpected shared-fs are the first things the runbook asks for). Missing
+  # or unreadable values stay "unknown" -- never a guess.
+  kata_cfg="$(kata_config_path 2>/dev/null || true)"
+  kernel="unknown"
+  image="unknown"
+  enable_debug="unknown"
+  shared_fs="unknown"
+  if [[ -n "$kata_cfg" && -r "$kata_cfg" ]]; then
+    kernel="$(sed -nE 's/^[[:space:]]*kernel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+               "$kata_cfg" 2>/dev/null | head -1)"
+    image="$(sed -nE 's/^[[:space:]]*image[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+               "$kata_cfg" 2>/dev/null | head -1)"
+    enable_debug="$(sed -nE 's/^[[:space:]]*enable_debug[[:space:]]*=[[:space:]]*"?([^"[:space:]#]+)"?.*/\1/p' \
+               "$kata_cfg" 2>/dev/null | head -1)"
+    shared_fs="$(sed -nE 's/^[[:space:]]*shared_fs[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+               "$kata_cfg" 2>/dev/null | head -1)"
+    [[ -n "$kernel" ]] || kernel="unknown"
+    [[ -n "$image" ]] || image="unknown"
+    [[ -n "$enable_debug" ]] || enable_debug="unknown"
+    [[ -n "$shared_fs" ]] || shared_fs="unknown"
+  fi
+  # /dev/vhost-vsock is the vsock transport QEMU needs; its absence is a
+  # fact worth printing, not a gate (gating lives in the pre-session asserts).
+  vhost_vsock="$(timeout 10 ls -l /dev/vhost-vsock 2>/dev/null || echo "missing")"
   # The PID-denied wedge (spec-fix-kata-qemu-pid-denied): QEMU refused
   # /run/vc/vm leaves no qemu process and no sandbox, so the label, the
   # SELinux mode, and any recent VMM denial are printed with the rest.
@@ -845,9 +906,21 @@ guest_boot_diagnostics() {
   printf '    container state : %s\n' "${state:-removed}"
   printf '    qemu processes  : %s\n' "${qemu:-0}"
   printf '    sandboxes       : %s\n' "${sandboxes:-none}"
-  printf '    guest kernel    : %s\n' "${kernel:-unknown}"
+  printf '    guest kernel    : %s\n' "$kernel"
+  printf '    guest image     : %s\n' "$image"
+  printf '    kata enable_debug : %s\n' "$enable_debug"
+  printf '    kata shared_fs    : %s\n' "$shared_fs"
+  printf '    vhost-vsock     : %s\n' "$vhost_vsock"
   printf '    vmm pid dir     : %s\n' "$vm_label"
   printf '    selinux mode    : %s\n' "$sel_mode"
+  # A non-Enforcing mode never blocks the boot, so say so and point at the
+  # guest console and Kata config instead of at policy.
+  if [[ "$sel_mode" != "Enforcing" ]]; then
+    printf '    selinux note    : %s mode is not blocking this boot; look at the guest console (timeout 10 journalctl -u containerd) and the Kata config, not at policy.\n' "$sel_mode"
+  fi
+  # The journal stays a printed pointer: executing journalctl here would race
+  # the agent TUI, so the watchdog prints the exact (timeout-wrapped) command.
+  printf '    journal pointer : timeout 10 journalctl -u containerd -n 50 --no-pager  # Kata shim errors\n'
   if command -v ausearch >/dev/null 2>&1; then
     local avc_tmp
     avc_tmp="$(mktemp 2>/dev/null || true)"
@@ -869,6 +942,12 @@ guest_boot_diagnostics() {
       while IFS= read -r line; do
         printf '      %s\n' "$line"
       done <<<"$avcs"
+      # Permissive-only denials (permissive=1) record what WOULD be denied,
+      # not what is blocked: no policy grants may be built from them, so say
+      # SELinux is not blocking and point at the console and config instead.
+      if ! grep -qv 'permissive=1' <<<"$avcs" 2>/dev/null; then
+        printf '    selinux note    : denials are permissive-only (permissive=1); SELinux is not blocking -- see the guest console and the Kata config, not policy.\n'
+      fi
     else
       printf '    recent VMM denials: none (ausearch -m avc -ts recent)\n'
     fi
@@ -878,32 +957,70 @@ guest_boot_diagnostics() {
 }
 
 guest_boot_watchdog() {
-  local limit="$1" waited=0 state
+  local limit="$1" waited=0 state seen_running=0 qemu_count qemu_exited=0
   while (( waited < limit )); do
     sleep 5
     waited=$(( waited + 5 ))
     state="$(timeout 10 docker inspect --format '{{.State.Status}}' \
                "$SECUREAI_OPENCODE_CONTAINER" 2>/dev/null || true)"
-    # running  -> the agent's process is live and the attach is on it.
-    # ""       -> --rm already removed the container, so the attach is returning.
     case "$state" in
-      running|""|exited|dead)
-        printf '%s\n' "$waited" >"$GUEST_BOOT_SECONDS_FILE"
-        return 0
+      running)
+        # The latch: the guest lived. Record the first-running time for the
+        # session-timing measurement, then keep watching -- a later
+        # removed/exited is a clean agent exit, not a boot failure.
+        if (( seen_running == 0 )); then
+          seen_running=1
+          printf '%s\n' "$waited" >"$GUEST_BOOT_SECONDS_FILE"
+        fi
+        ;;
+      ""|exited|dead)
+        # --rm removes the container the moment the agent exits (clean end),
+        # but it also vanishes when the create itself failed. Only the latch
+        # tells them apart: success when running was seen, fast failure when
+        # the guest never lived. On the success path the first-running time
+        # already in the seconds file is left alone -- overwriting it with the
+        # exit time would corrupt the session-timing measurement.
+        if (( seen_running == 1 )); then
+          return 0
+        fi
+        qemu_exited=1
+        break
         ;;
     esac
+    # Fast QEMU exit while still Created (spec-fix-secureai-kata-vm-boot-failure):
+    # QEMU gone ~5s after launch leaves the container in Created while the
+    # shim waits on a vsock that will never answer. Two polls (>=10s) of grace
+    # cover a slow shim start; after that, no QEMU with no running is a boot
+    # failure, diagnosed now instead of at the 180s limit.
+    if (( seen_running == 0 )) && [[ "$state" == "created" ]] && (( waited >= 10 )); then
+      qemu_count="$(timeout 10 pgrep -c -f qemu-system 2>/dev/null || echo 0)"
+      if [[ -z "$qemu_count" || "$qemu_count" == "0" ]]; then
+        qemu_exited=1
+        break
+      fi
+    fi
   done
+  if (( seen_running == 1 )) && (( qemu_exited == 0 )); then
+    # Reached the limit after a live guest: the boot succeeded and the
+    # foreground attach owns the session from here. Silent, like before.
+    return 0
+  fi
   # The marker carries the limit as content on purpose: the foreground path
   # tests it with -s (non-empty), so an empty `: >` marker would read as "no
   # failure" and the session would hang exactly as it did before.
   printf '%s\n' "$limit" >"$GUEST_BOOT_MARKER"
   {
     printf '\n'
-    warn "The Kata guest has not reached 'running' after ${limit}s."
+    if (( qemu_exited == 1 )); then
+      warn "QEMU exited before the guest reached 'running' (state '${state:-removed}' after ${waited}s, never saw running)."
+      printf " QEMU is gone while the container never left '%s' -- the VM failed to come up, not the agent.\n" "${state:-removed}"
+    else
+      warn "The Kata guest has not reached 'running' after ${limit}s."
+    fi
     printf " Kata boots a real VM, so this is the VM failing to come up -- not the agent.\n"
     guest_boot_diagnostics
     printf '\n    Look at:\n'
-    printf '      journalctl -u containerd -n 50 --no-pager   # Kata shim errors\n'
+    printf '      timeout 10 journalctl -u containerd -n 50 --no-pager   # Kata shim errors\n'
     printf '      dmesg | tail -30                             # KVM / virtio failures\n'
     printf '      ls -l /var/cache/kata-containers/            # guest kernel + initrd\n'
     printf '      ls -ldZ /run/vc/vm; getenforce               # VMM PID path label + mode\n'
@@ -994,6 +1111,7 @@ cmd_opencode() {
   assert_kata_runtime_type
   assert_kata_guest_assets
   assert_kata_vmm_path
+  warn_kata_nested_kvm
 
   # An interactive session is a terminal contract: with no TTY, `-it` fails
   # with docker's "input device is not a TTY" rather than with a message that

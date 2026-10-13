@@ -71,3 +71,33 @@
 - source_spec: `architecture/secureai-kata-opencode/spec-fix-kata-qemu-pid-denied.md`
   summary: No retry path when a live-audit2allow module is refused on an older host policy (medium-unverified).
   evidence: Refusal demonstrated only for the baseline io_uring block on F38; settles with a live-denial rebuild run on an old-policy host showing the same refusal.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-secureai-kata-vm-boot-failure.md`
+  summary: >-
+    A/B the RPM Go path against the upstream static Kata 4.2 Rust bundle.
+  evidence: >-
+    A manual VM using the upstream static Kata 4.2 Rust bundle with nerdctl
+    boots fine on the same class of host where every RPM-path boot (Fedora
+    44, kata 3.26 Go + Docker 29.7, QEMU gone ~5s after launch, shim vsock
+    ...:1024 timeout) fails. This spec repairs the RPM path in place and
+    deliberately does not switch runtimes; a controlled static-bundle A/B on
+    one host and one network would isolate packaging from configuration, but
+    that comparison is out of scope here.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-secureai-kata-vm-boot-failure.md`
+  summary: >-
+    Bare-bisect runbook for vsock-timeout boots (debug config, minimal Kata config).
+  evidence: >-
+    Debug config (enable_debug, agent debug) is a document-only runbook in
+    this spec: the CLI reads the active Kata configuration.toml for
+    diagnostics but must never auto-edit it. A future runbook -- enable
+    debug, capture the guest console, bisect a minimal config -- would
+    shorten the next vsock-timeout investigation, but no live failing VM
+    exists to validate it against, so it stays deferred.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-secureai-kata-vm-boot-failure.md`
+  summary: Scope fast QEMU-exit detection to the session sandbox instead of global pgrep.
+  evidence: Watchdog counts all host qemu-system processes, so an unrelated QEMU masks detection until the 180s limit; scoping needs sandbox-ID plumbing the spec does not settle.
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-secureai-kata-vm-boot-failure.md`
+  summary: Settle QEMU-exit threshold and agent-crash distinction live (medium-unverified).
+  evidence: The >=10s grace and exited-with-QEMU-running mapping are unit-tested with stubs; settles with a live F44 run showing fast QEMU exit vs slow shim start and agent-crash behavior.

@@ -723,6 +723,17 @@ label_paths() {
 # falls back to a baseline covering those three otherwise, installs it with
 # semodule, and asserts with semodule -l plus ls -ldZ. Enforcement is never
 # relaxed: Enforcing stays on throughout.
+#
+# Rebuild runbook, document-only (spec-fix-secureai-kata-vm-boot-failure):
+# on Enforcing, if sessions still wedge in Created with fresh VMM denials,
+# rebuild the module from LIVE Enforcing denials only:
+#   ausearch -m avc -ts recent | grep -Ei 'qemu|virtiofsd|kata|vhost|/run/vc|io_uring' >kata.avc
+#   audit2allow -M secureai-kata -i kata.avc && sudo semodule -i secureai-kata.pp
+# Never build grants from Permissive denials (permissive=1): they record what
+# WOULD be denied, not what is blocked, so a module built from them grants
+# nothing the host needs while widening policy for no reason. This function
+# takes no Permissive AVC input by construction -- it returns before
+# collecting any denial unless getenforce reports Enforcing.
 # =========================================================================
 ensure_kata_vmm_policy() {
   log "Ensuring the Kata VMM SELinux policy for /run/vc/vm"
@@ -779,6 +790,9 @@ ensure_kata_vmm_policy() {
   # Live denials first: audit2allow derives the exact source types from the
   # running policy, which a shipped baseline can only guess at. Filtered to
   # the VMM path so unrelated recent denials do not widen the module.
+  # Provenance: the Enforcing early-return above means these denials were
+  # collected on an enforcing host -- never build from permissive=1 lines,
+  # which record would-deny rather than blocked (see the header runbook).
   local live_avc="${tmpdir}/kata.avc"
   if command -v ausearch >/dev/null 2>&1; then
     ausearch -m avc -ts recent 2>/dev/null \
