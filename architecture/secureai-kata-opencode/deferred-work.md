@@ -63,3 +63,11 @@
     Fixed alongside the /opt/secureai labeling: the assertion now compares the
     context's type field (cut -d: -f3) instead of the whole context string, so
     a correctly labelled host no longer warns.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-kata-qemu-pid-denied.md`
+  summary: Hardcoded /run/vc/sandbox path in guest_boot_diagnostics ignores fixture overrides.
+  evidence: Pre-existing line untouched by this change; guest path already honors SECUREAI_KATA_VM_DIR while the sandbox listing does not.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-kata-qemu-pid-denied.md`
+  summary: No retry path when a live-audit2allow module is refused on an older host policy (medium-unverified).
+  evidence: Refusal demonstrated only for the baseline io_uring block on F38; settles with a live-denial rebuild run on an old-policy host showing the same refusal.

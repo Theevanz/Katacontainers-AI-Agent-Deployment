@@ -749,6 +749,89 @@ class TestCliGuestAssetGate(KataGuestAssetsMixin, unittest.TestCase):
         self.assertIn("kata guest kernel", body)
 
 
+class TestKataVmmPathGate(unittest.TestCase):
+    """The QEMU PID-directory gate (spec-fix-kata-qemu-pid-denied).
+
+    When /run/vc/vm is missing, wrongly labelled, or mode-stripped,
+    containerd reports `cannot create PID file ... Permission denied` and the
+    guest wedges in Created -- where every docker call blocks behind the shim
+    lock. This gate fails the session in under 10s with the path, its current
+    label, and the repair command instead of hanging blank.
+
+    These tests EXECUTE the real assert_kata_vmm_path against fixture
+    directories with faked `ls`/`getenforce`/`stat`, because the behaviour
+    that matters -- dying with a named repair vs. passing a writable dir --
+    cannot be seen by matching source text.
+    """
+
+    def _run(self, pid_dir):
+        script = "\n".join([
+            'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            'ok()   { printf "ok: %s\\n" "$*"; }',
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'FAKE_LS_LINE="$2"',
+            'ls() {',
+            '  if [[ "$1" == "-ldZ" ]]; then printf "%s\\n" "$FAKE_LS_LINE"; return 0; fi',
+            '  command ls "$@";',
+            '}',
+            'getenforce() { printf "Enforcing\\n"; }',
+            function_body(CLI, "assert_kata_vmm_path") + "\n}",
+            'assert_kata_vmm_path "$3"',
+            'printf "GATE_PASSED\\n"',
+        ])
+        return subprocess.run(
+            ["bash", "-c", script, "bash", "Enforcing",
+             "drwxr-x---. 2 root root system_u:object_r:container_var_run_t:s0 40 /fake/vm",
+             pid_dir],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ},
+        )
+
+    def _present(self):
+        path = tempfile.mkdtemp()
+        self.addCleanup(lambda: os.path.isdir(path) and os.rmdir(path))
+        return path
+
+    def _absent(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        os.unlink(path)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def test_writable_dir_passes(self):
+        result = self._run(self._present())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE_PASSED", result.stdout)
+
+    def test_missing_dir_fails_naming_path_and_repair(self):
+        missing = self._absent()
+        result = self._run(missing)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(missing, result.stderr)
+        self.assertIn("restorecon", result.stderr)
+        self.assertIn("ausearch -m avc -ts recent", result.stderr)
+
+    def test_opencode_checks_before_starting_anything(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("assert_kata_vmm_path", body)
+        self.assertLess(body.index("assert_kata_guest_assets"),
+                        body.index("assert_kata_vmm_path"))
+        self.assertLess(body.index("assert_kata_vmm_path"),
+                        body.index("Starting OpenCode"))
+
+    def test_status_reports_vmm_dir_and_avcs(self):
+        body = function_body(CLI, "cmd_status")
+        self.assertIn("kata vmm pid dir", body)
+        self.assertIn("kata AVCs (recent)", body)
+
+    def test_installer_wires_the_policy_after_labelling(self):
+        body = function_body(INSTALLER, "main")
+        self.assertIn("ensure_kata_vmm_policy", body)
+        self.assertLess(body.index("label_paths"),
+                        body.index("ensure_kata_vmm_policy"))
+
+
 class TestGuestBootWatchdog(unittest.TestCase):
     """Kata boots a real VM, so `compose run -it` goes silent before the attach.
 
@@ -1657,6 +1740,334 @@ class TestProxyHealthcheckExecuted(unittest.TestCase):
         result = self._run(self._serve(), config_dir)
         self.assertNotEqual(result.returncode, 0,
                             "missing whitelist must exit non-zero")
+
+
+class TestKataVmmPathGate(unittest.TestCase):
+    """assert_kata_vmm_path: the pre-session gate for /run/vc/vm.
+
+    EXECUTED against fixtures with stubbed getenforce/stat, because the
+    properties that matter -- dying on a wrong label only when Enforcing,
+    judging owner write+exec arithmetically rather than by glob, and
+    distinguishing a missing dir from a non-directory -- are invisible to
+    source matching. stat is stubbed so the tests are deterministic on any
+    host regardless of its SELinux state.
+    """
+
+    STUBS = "\n".join([
+        'getenforce() { printf "%s\\n" "${STUB_ENFORCE:-Enforcing}"; }',
+        'stat() {',
+        '  if [[ "$*" == *"%C"* ]]; then printf "%s\\n" "$STUB_CONTEXT";',
+        '  elif [[ "$*" == *"%a"* ]]; then printf "%s\\n" "$STUB_MODE";',
+        '  else command stat "$@"; fi',
+        '}',
+    ])
+
+    def _run(self, target, context="system_u:object_r:container_var_run_t:s0",
+             mode="755", enforce="Enforcing"):
+        body = function_body(CLI, "assert_kata_vmm_path") + "\n}"
+        script = "\n".join([
+            'die()  { printf "DIE: %s\\n" "$*" >&2; exit 1; }',
+            'ok()   { printf "OK: %s\\n" "$*"; }',
+            'warn() { printf "WARN: %s\\n" "$*" >&2; }',
+            self.STUBS,
+            body,
+            'assert_kata_vmm_path "$1"',
+        ])
+        env = {**os.environ, "STUB_CONTEXT": context, "STUB_MODE": mode,
+               "STUB_ENFORCE": enforce}
+        return subprocess.run(
+            ["bash", "-c", script, "bash", target],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+
+    def _dir(self, mode="0755"):
+        path = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            path, ignore_errors=True))
+        os.chmod(path, int(mode, 8))
+        return path
+
+    def test_healthy_dir_passes(self):
+        result = self._run(self._dir())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("OK:", result.stdout)
+        self.assertIn("container_var_run_t", result.stdout)
+
+    def test_four_digit_mode_with_owner_rwx_passes(self):
+        # 1755/2755 carry owner rwx; a 3-char glob would reject them.
+        result = self._run(self._dir("1755"), mode="1755")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_wrong_label_dies_naming_path_label_and_repair(self):
+        target = self._dir()
+        result = self._run(target, context="user_u:object_r:user_tmp_t:s0")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(target, result.stderr)
+        self.assertIn("user_tmp_t", result.stderr)
+        self.assertIn("container_var_run_t", result.stderr)
+        self.assertIn("semanage", result.stderr)
+        self.assertIn("restorecon", result.stderr)
+        self.assertIn("ausearch", result.stderr)
+
+    def test_unreadable_context_dies_as_unknown(self):
+        # stat prints "?" when the context cannot be read; that must fail
+        # closed as unknown, never as an empty match that passes.
+        result = self._run(self._dir(), context="?")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("'unknown'", result.stderr)
+
+    def test_mode_stripped_dies_naming_mode_and_chmod(self):
+        result = self._run(self._dir("0555"), mode="555")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("555", result.stderr)
+        self.assertIn("chmod", result.stderr)
+
+    def test_owner_rw_without_exec_dies(self):
+        # 666 has owner write but no exec: entering the dir still fails.
+        result = self._run(self._dir("0666"), mode="666")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("666", result.stderr)
+
+    def test_permissive_skips_label_but_keeps_mode(self):
+        target = self._dir()
+        passed = self._run(
+            target, context="user_u:object_r:user_tmp_t:s0",
+            enforce="Permissive")
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        failed = self._run(target, mode="555", enforce="Permissive")
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("555", failed.stderr)
+
+    def test_regular_file_reports_not_a_directory(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        result = self._run(path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not a directory", result.stderr)
+        self.assertIn("rm -f", result.stderr)
+
+    def test_missing_dir_names_mkdir_repair(self):
+        missing = os.path.join(tempfile.mkdtemp(), "nope")
+        result = self._run(missing)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing", result.stderr)
+        self.assertIn("mkdir", result.stderr)
+
+    def test_opencode_runs_the_gate_before_starting_anything(self):
+        body = function_body(CLI, "cmd_opencode")
+        self.assertIn("assert_kata_vmm_path", body)
+        self.assertLess(body.index("assert_kata_vmm_path"),
+                        body.index("Starting OpenCode"))
+
+
+class TestInstallerVmmPolicyExecution(unittest.TestCase):
+    """ensure_kata_vmm_policy executed with a stubbed SELinux toolchain.
+
+    The function needs root and real SELinux to run for real; here every
+    privileged tool is a stub recording its calls, so the properties that
+    matter -- the semodule -l assertion matching a "name version" listing,
+    the baseline build when no live denial exists, and cleanup of the
+    scratch dir -- are observed, not matched as text.
+    """
+
+    def _run(self, semodule_list="secureai-kata 1.0\n"):
+        body = function_body(INSTALLER, "ensure_kata_vmm_policy") + "\n}"
+        calls = os.path.join(tempfile.mkdtemp(), "calls")
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            os.path.dirname(calls), ignore_errors=True))
+        script = "\n".join([
+            'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            'ok()   { printf "ok: %s\\n" "$*"; }',
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'log()  { printf "==> %s\\n" "$*"; }',
+            'getenforce() { printf "Enforcing\\n"; }',
+            'semanage() { printf "semanage %s\\n" "$*" >>"$STUB_CALLS"; return 0; }',
+            'restorecon() { printf "restorecon %s\\n" "$*" >>"$STUB_CALLS"; return 0; }',
+            'install() { printf "install %s\\n" "$*" >>"$STUB_CALLS"; return 0; }',
+            'ausearch() { return 1; }',
+            'audit2allow() { printf "audit2allow %s\\n" "$*" >>"$STUB_CALLS"; return 0; }',
+            'checkmodule() {',
+            '  local o="" p="";',
+            '  for a in "$@"; do if [[ "$p" == "-o" ]]; then o="$a"; fi; p="$a"; done;',
+            '  [[ -n "$o" ]] && : >"$o"; return 0;',
+            '}',
+            'semodule_package() {',
+            '  local o="" p="";',
+            '  for a in "$@"; do if [[ "$p" == "-o" ]]; then o="$a"; fi; p="$a"; done;',
+            '  [[ -n "$o" ]] && : >"$o"; return 0;',
+            '}',
+            'semodule() {',
+            '  if [[ "$1" == "-i" ]]; then',
+            '    printf "semodule -i %s\\n" "$2" >>"$STUB_CALLS";',
+            '    [[ -f "$2" ]] || return 1; return 0;',
+            '  fi;',
+            # The listing carries a version beside the name, as on F44: the
+            # assertion must match the name field, not the whole line.
+            '  if [[ "$1" == "-l" ]]; then printf "%s" "$STUB_SEMODULE_L"; return 0; fi;',
+            '  return 0;',
+            '}',
+            'ls() {',
+            '  if [[ "$*" == *"/run/vc/vm"* ]]; then',
+            '    printf "drwxr-xr-x. 2 root root system_u:object_r:container_var_run_t:s0 40 Oct 13 10:47 /run/vc/vm\\n";',
+            '    return 0;',
+            '  fi;',
+            '  command ls "$@";',
+            '}',
+            'stat() {',
+            '  if [[ "$*" == *"/run/vc/vm"* ]]; then',
+            '    if [[ "$*" == *"%C"* ]]; then',
+            '      printf "system_u:object_r:container_var_run_t:s0\\n";',
+            '    else printf "755\\n"; fi;',
+            '    return 0;',
+            '  fi;',
+            '  command stat "$@";',
+            '}',
+            body,
+            'ensure_kata_vmm_policy',
+        ])
+        env = {**os.environ, "STUB_CALLS": calls,
+               "STUB_SEMODULE_L": semodule_list}
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            timeout=120, env=env,
+        )
+        recorded = ""
+        if os.path.exists(calls):
+            with open(calls, encoding="utf-8") as fh:
+                recorded = fh.read()
+        return result, recorded
+
+    def test_baseline_builds_installs_and_asserts(self):
+        result, recorded = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("secureai-kata policy module loaded", result.stdout)
+        self.assertIn("container_var_run_t", result.stdout)
+        self.assertIn("semodule -i", recorded)
+        self.assertIn("semanage", recorded)
+        self.assertIn("ausearch -m avc -ts recent", result.stderr)
+
+    def test_missing_module_listing_is_fatal(self):
+        result, _ = self._run(semodule_list="other-module 2.0\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("semodule -l", result.stderr)
+
+
+class TestVmmDiagnosticsLines(unittest.TestCase):
+    """guest_boot_diagnostics prints the VMM label, mode, and denials.
+
+    EXECUTED with stubbed docker/ausearch, following the watchdog harness
+    pattern: what the operator sees on a PID-denied wedge must include the
+    /run/vc/vm label and any recent VMM denial.
+    """
+
+    def _run(self, avc_stdout="", avc_rc=0):
+        body = function_body(CLI, "guest_boot_diagnostics") + "\n}"
+        script = "\n".join([
+            'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            'ok()   { printf "ok: %s\\n" "$*"; }',
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'timeout() { shift; "$@"; }',
+            'SECUREAI_OPENCODE_CONTAINER=secureai-opencode',
+            'kata_config_path() { printf "%s\\n" /dev/null; }',
+            'docker() { printf "created\\n"; return 0; }',
+            'pgrep() { printf "0\\n"; return 0; }',
+            'ls() {',
+            '  if [[ "$*" == *"$STUB_VM_DIR"* ]]; then',
+            '    printf "drwxr-xr-x. 2 root root system_u:object_r:container_var_run_t:s0 40 Oct 13 10:47 /run/vc/vm\\n";',
+            '    return 0;',
+            '  fi;',
+            '  return 1;',
+            '}',
+            'getenforce() { printf "Enforcing\\n"; }',
+            'ausearch() { printf "%s" "$STUB_AVC"; return "$STUB_AVC_RC"; }',
+            body,
+            'guest_boot_diagnostics',
+        ])
+        vm_dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            vm_dir, ignore_errors=True))
+        env = {**os.environ, "SECUREAI_KATA_VM_DIR": vm_dir,
+               "STUB_VM_DIR": vm_dir, "STUB_AVC": avc_stdout,
+               "STUB_AVC_RC": str(avc_rc)}
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            timeout=60, env=env,
+        )
+
+    def test_reports_label_mode_and_matching_denial(self):
+        avc = ('type=AVC msg=audit(1): avc: denied { read } for pid=1 '
+               'comm="qemu-system-x8" tcontext=system_u:object_r:vhost_device_t:s0 '
+               'tclass=chr_file\n')
+        result = self._run(avc_stdout=avc)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("vmm pid dir", result.stdout)
+        self.assertIn("container_var_run_t", result.stdout)
+        self.assertIn("selinux mode", result.stdout)
+        self.assertIn("Enforcing", result.stdout)
+        self.assertIn("qemu-system-x8", result.stdout)
+
+    def test_reports_none_when_the_log_is_empty(self):
+        result = self._run(avc_stdout="<no matches>\n", avc_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recent VMM denials: none", result.stdout)
+
+
+class TestStatusVmmBlock(unittest.TestCase):
+    """cmd_status reports the VMM pid dir, SELinux mode, and AVC count.
+
+    EXECUTED with stubbed docker/ausearch, following the whitelist-list
+    pattern of fixture dirs plus extracted functions.
+    """
+
+    def _run(self):
+        bodies = "\n".join(
+            function_body(CLI, name) + "\n}"
+            for name in ("kata_config_path", "kata_guest_assets",
+                         "kata_missing_assets", "kata_missing_guest_assets",
+                         "cmd_status"))
+        script = "\n".join([
+            'die()  { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            'ok()   { printf "ok: %s\\n" "$*"; }',
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'log()  { printf "==> %s\\n" "$*"; }',
+            'need_docker() { return 0; }',
+            'timeout() { shift; "$@"; }',
+            'docker() {',
+            '  if [[ "$*" == *".Runtimes"* ]]; then printf "{\\"kata\\":{},\\"runc\\":{}}"; return 0; fi;',
+            '  if [[ "$1" == "version" ]]; then printf "28.1.0"; return 0; fi;',
+            '  printf "running"; return 0;',
+            '}',
+            'getenforce() { printf "Enforcing\\n"; }',
+            'ausearch() { printf "<no matches>\\n" >&2; return 1; }',
+            bodies,
+            'cmd_status',
+        ])
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            tmp, ignore_errors=True))
+        vm_dir = os.path.join(tmp, "vm")
+        os.makedirs(vm_dir)
+        env = {**os.environ,
+               "SECUREAI_DAEMON_JSON": "/nonexistent/daemon.json",
+               "SECUREAI_KATA_VM_DIR": vm_dir,
+               "SECUREAI_PROXY_CONTAINER": "secureai-proxy",
+               "SECUREAI_OPENCODE_CONTAINER": "secureai-opencode",
+               "SECUREAI_ETC": tmp, "SECUREAI_VAR": tmp,
+               "SECUREAI_CA": os.path.join(tmp, "ca.pem"),
+               "SECUREAI_COMPOSE_FILE": "/nonexistent.yml"}
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True,
+            timeout=60, env=env,
+        )
+
+    def test_status_reports_the_vmm_block(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kata vmm pid dir", result.stdout)
+        self.assertIn("SELinux", result.stdout)
+        self.assertIn("Enforcing", result.stdout)
+        self.assertIn("kata AVCs (recent)", result.stdout)
 
 
 if __name__ == "__main__":

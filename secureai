@@ -569,6 +569,10 @@ assert_runtime_registered() {
 # overridable so each can be executed against a fixture.
 SECUREAI_DAEMON_JSON="${SECUREAI_DAEMON_JSON:-/etc/docker/daemon.json}"
 
+# QEMU writes its PID file under /run/vc/vm/<id>/pid. Overridable so the
+# VMM-path check can be executed against a fixture, like SECUREAI_DAEMON_JSON.
+SECUREAI_KATA_VM_DIR="${SECUREAI_KATA_VM_DIR:-/run/vc/vm}"
+
 # A runtime can be REGISTERED and still be unusable: Docker's daemon.json
 # `runtimeType` for a shim v2 runtime must be the containerd runtime CLASS
 # (`io.containerd.<name>.v2`, which Docker resolves to the
@@ -675,6 +679,80 @@ assert_kata_guest_assets() {
    journalctl -u kata-osbuilder-generate -b --no-pager"
 }
 
+# The Kata shim writes QEMU's PID file under /run/vc/vm/<id>/pid. When that
+# path is missing, wrongly labelled, or mode-stripped, containerd reports
+#   qemu-system-x86_64: cannot create PID file ... Permission denied
+# and the guest wedges in Created -- where every docker call, including
+# `docker inspect`, blocks behind the shim lock. This gate fails the session
+# in under 10s with the path, its current label, and the repair command,
+# instead of hanging blank until the 180s watchdog.
+#
+# The path is a parameter so the check can be executed against a fixture.
+assert_kata_vmm_path() {
+  local pid_dir="${1:-${SECUREAI_KATA_VM_DIR:-/run/vc/vm}}"
+  local sel_mode label_line vm_type mode_bits mode_ok
+  sel_mode="$(getenforce 2>/dev/null || echo unknown)"
+  label_line="$(ls -ldZ "$pid_dir" 2>/dev/null || echo missing)"
+  if [[ -e "$pid_dir" && ! -d "$pid_dir" ]]; then
+    die "Kata cannot start: ${pid_dir} exists but is not a directory, so QEMU
+  cannot create its PID file beneath it and the guest would wedge in Created.
+  SELinux mode: ${sel_mode}.
+  Repair with:
+    sudo rm -f ${pid_dir} && sudo mkdir -p ${pid_dir} && sudo restorecon -RF ${pid_dir}
+    ls -ldZ ${pid_dir}; getenforce"
+  fi
+  if [[ ! -d "$pid_dir" ]]; then
+    die "Kata cannot start: its QEMU PID directory ${pid_dir} is missing, so
+  QEMU cannot create its PID file and the guest would wedge in Created.
+  SELinux mode: ${sel_mode}.
+  Repair with:
+    sudo mkdir -p ${pid_dir} && sudo restorecon -RF ${pid_dir}
+    ls -ldZ ${pid_dir}; getenforce
+  If the path keeps coming back wrong, or denials persist, re-run
+  install-fedora.sh (it relabels /run/vc and reinstalls the secureai-kata
+  policy module). Inspect denials, if any, with:
+    ausearch -m avc -ts recent"
+  fi
+  # stat reports the context directly, whatever shape ls takes; empty or ?
+  # means the context could not be read.
+  vm_type="$(stat -c %C "$pid_dir" 2>/dev/null | cut -d: -f3 || true)"
+  if [[ -z "$vm_type" || "$vm_type" == "?" ]]; then
+    vm_type="unknown"
+  fi
+  # A wrong label only blocks when enforcement is on; elsewhere the session
+  # would work, so only the missing-path and mode checks apply there.
+  if [[ "$sel_mode" == "Enforcing" && "$vm_type" != "container_var_run_t" ]]; then
+    die "Kata cannot start: ${pid_dir} carries '${vm_type:-unknown}', expected
+  container_var_run_t, so the shim is refused its PID file and the guest would
+  wedge in Created. Observed: ${label_line}. SELinux mode: ${sel_mode}.
+  Repair with:
+    sudo semanage fcontext -m -t container_var_run_t \"/var/run/vc(/.*)?\"
+    sudo restorecon -RF ${pid_dir}
+    ls -ldZ ${pid_dir}
+  If denials persist after the relabel, rebuild the VMM policy from live
+  denials (install-fedora.sh does this) and inspect them with:
+    ausearch -m avc -ts recent"
+  fi
+  # Owner write AND execute: entering the directory and creating the PID
+  # file need both, so a bit-glob would pass modes that still fail (222, 666)
+  # and fail modes that work (1755, 2755). Root bypasses DAC, so -w as root
+  # proves nothing; the bits are what a dropped-privilege QEMU needs.
+  mode_bits="$(stat -c %a "$pid_dir" 2>/dev/null || echo unknown)"
+  mode_ok=0
+  if [[ "$mode_bits" =~ ^[0-7]+$ ]] && (( (8#$mode_bits & 0300) == 0300 )); then
+    mode_ok=1
+  fi
+  if [[ "$mode_ok" -ne 1 ]]; then
+    die "Kata cannot start: ${pid_dir} has mode ${mode_bits}, without owner
+  write and execute, so QEMU cannot create its PID file there. Observed:
+  ${label_line}. SELinux mode: ${sel_mode}.
+  Repair with:
+    sudo chmod 0755 ${pid_dir}
+    ls -ldZ ${pid_dir}"
+  fi
+  ok "${pid_dir} is ${vm_type}, mode ${mode_bits}"
+}
+
 # AD-14: the session is a pair. Both containers carry --rm, and a trap tears
 # the pair down on INT/TERM so nothing is orphaned. No systemd unit
 # auto-starts the proxy -- that would contradict per-session containment (F12).
@@ -712,17 +790,51 @@ GUEST_BOOT_SECONDS_FILE=""
 # What an operator needs when the VM did not come up. Each line is a fact they
 # would otherwise go and collect by hand.
 guest_boot_diagnostics() {
-  local state qemu sandboxes kernel
+  local state qemu sandboxes kernel vm_label sel_mode avcs
   state="$(timeout 10 docker inspect --format '{{.State.Status}}' \
              "$SECUREAI_OPENCODE_CONTAINER" 2>/dev/null || echo removed)"
   qemu="$(pgrep -c -f qemu-system 2>/dev/null || true)"
   sandboxes="$(ls /run/vc/sandbox 2>/dev/null | tr '\n' ' ')"
   kernel="$(sed -nE 's/^[[:space:]]*kernel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
              "$(kata_config_path 2>/dev/null)" 2>/dev/null | head -1)"
+  # The PID-denied wedge (spec-fix-kata-qemu-pid-denied): QEMU refused
+  # /run/vc/vm leaves no qemu process and no sandbox, so the label, the
+  # SELinux mode, and any recent VMM denial are printed with the rest.
+  vm_label="$(ls -ldZ "${SECUREAI_KATA_VM_DIR:-/run/vc/vm}" 2>/dev/null || echo missing)"
+  sel_mode="$(getenforce 2>/dev/null || echo unknown)"
   printf '    container state : %s\n' "${state:-removed}"
   printf '    qemu processes  : %s\n' "${qemu:-0}"
   printf '    sandboxes       : %s\n' "${sandboxes:-none}"
   printf '    guest kernel    : %s\n' "${kernel:-unknown}"
+  printf '    vmm pid dir     : %s\n' "$vm_label"
+  printf '    selinux mode    : %s\n' "$sel_mode"
+  if command -v ausearch >/dev/null 2>&1; then
+    local avc_tmp
+    avc_tmp="$(mktemp 2>/dev/null || true)"
+    if [[ -z "$avc_tmp" ]]; then
+      avcs="UNREADABLE"
+    # ausearch exits 1 with "<no matches>" on stderr when the log holds no
+    # AVCs -- that is a successful empty observation, not an unreadable log.
+    elif timeout 10 ausearch -m avc -ts recent >"$avc_tmp" 2>"${avc_tmp}.err" \
+        || grep -qi 'no matches' "$avc_tmp" "${avc_tmp}.err" 2>/dev/null; then
+      avcs="$(grep -Ei 'qemu|virtiofsd|kata|vhost|/run/vc|io_uring' "$avc_tmp" | tail -5 || true)"
+    else
+      avcs="UNREADABLE"
+    fi
+    [[ -n "$avc_tmp" ]] && rm -f "$avc_tmp" "${avc_tmp}.err"
+    if [[ "$avcs" == "UNREADABLE" ]]; then
+      printf '    recent VMM denials: unknown (audit log unreadable)\n'
+    elif [[ -n "$avcs" ]]; then
+      printf '    recent VMM denials (ausearch -m avc -ts recent):\n'
+      while IFS= read -r line; do
+        printf '      %s\n' "$line"
+      done <<<"$avcs"
+    else
+      printf '    recent VMM denials: none (ausearch -m avc -ts recent)\n'
+    fi
+  else
+    printf '    recent VMM denials: unknown (ausearch not available)\n'
+  fi
 }
 
 guest_boot_watchdog() {
@@ -754,6 +866,8 @@ guest_boot_watchdog() {
     printf '      journalctl -u containerd -n 50 --no-pager   # Kata shim errors\n'
     printf '      dmesg | tail -30                             # KVM / virtio failures\n'
     printf '      ls -l /var/cache/kata-containers/            # guest kernel + initrd\n'
+    printf '      ls -ldZ /run/vc/vm; getenforce               # VMM PID path label + mode\n'
+    printf '      ausearch -m avc -ts recent | grep -Ei "qemu|virtiofsd|kata"  # VMM denials\n'
   } >&2
   # Removing the guest is what unblocks the foreground attach; without it the
   # session hangs here indefinitely, which is the bug this whole path exists to
@@ -824,6 +938,7 @@ cmd_opencode() {
   assert_runtime_registered runc
   assert_kata_runtime_type
   assert_kata_guest_assets
+  assert_kata_vmm_path
 
   # An interactive session is a terminal contract: with no TTY, `-it` fails
   # with docker's "input device is not a TTY" rather than with a message that
@@ -1119,6 +1234,31 @@ cmd_status() {
   else
     printf '    %-22s %s\n' "kata guest kernel" "MISSING: ${guest_missing}"
   fi
+  # The VMM PID path: QEMU refused /run/vc/vm wedges the guest in Created, so
+  # its label, the SELinux mode, and the recent kata AVC count are reported
+  # here -- where an operator looks first -- and not only as a session die.
+  local kata_vm_dir="${SECUREAI_KATA_VM_DIR:-/run/vc/vm}"
+  local vm_ls
+  vm_ls="$(ls -ldZ "$kata_vm_dir" 2>/dev/null || echo "missing")"
+  printf '    %-22s %s\n' "kata vmm pid dir" "$vm_ls"
+  printf '    %-22s %s\n' "SELinux" "$(getenforce 2>/dev/null || echo unknown)"
+  local kata_avcs="unknown (ausearch not available)"
+  if command -v ausearch >/dev/null 2>&1; then
+    local avc_tmp
+    avc_tmp="$(mktemp 2>/dev/null || true)"
+    if [[ -z "$avc_tmp" ]]; then
+      kata_avcs="unknown (could not create scratch file)"
+    # ausearch exits 1 with "<no matches>" on stderr when the log holds no
+    # AVCs -- that is a successful empty observation, not an unreadable log.
+    elif timeout 10 ausearch -m avc -ts recent >"$avc_tmp" 2>"${avc_tmp}.err" \
+        || grep -qi 'no matches' "$avc_tmp" "${avc_tmp}.err" 2>/dev/null; then
+      kata_avcs="$(grep -Eci 'qemu|virtiofsd|kata|vhost|/run/vc|io_uring' "$avc_tmp" || true)"
+    else
+      kata_avcs="unknown (audit log unreadable -- run status with sudo)"
+    fi
+    [[ -n "$avc_tmp" ]] && rm -f "$avc_tmp" "${avc_tmp}.err"
+  fi
+  printf '    %-22s %s\n' "kata AVCs (recent)" "$kata_avcs"
 
   local container
   for container in "$SECUREAI_PROXY_CONTAINER" "$SECUREAI_OPENCODE_CONTAINER"; do

@@ -697,6 +697,224 @@ label_paths() {
 }
 
 # =========================================================================
+# Kata VMM SELinux policy (spec-fix-kata-qemu-pid-denied).
+#
+# Observed on nested F44 Enforcing: the Kata shim starts, containerd reports
+#   qemu-system-x86_64: cannot create PID file ... Permission denied
+# under /run/vc/vm, and the guest wedges in Created. That directory already
+# carries container_var_run_t, so a relabel alone cannot fix it -- the VMM
+# domains need allow rules for the three denials ausearch shows:
+#   qemu denied read/write on /dev/vhost-vsock,
+#   virtiofsd denied mounton on /,
+#   qemu denied create on io_uring.
+# This builds an audit2allow module from LIVE denials when they exist and
+# falls back to a baseline covering those three otherwise, installs it with
+# semodule, and asserts with semodule -l plus ls -ldZ. Enforcement is never
+# relaxed: Enforcing stays on throughout.
+# =========================================================================
+ensure_kata_vmm_policy() {
+  log "Ensuring the Kata VMM SELinux policy for /run/vc/vm"
+
+  if ! command -v getenforce >/dev/null 2>&1; then
+    warn "SELinux tooling is absent; skipping the Kata VMM policy."
+    return 0
+  fi
+
+  local mode
+  mode="$(getenforce 2>/dev/null || echo Disabled)"
+  if [[ "$mode" != "Enforcing" ]]; then
+    warn "SELinux is ${mode}, not Enforcing. The Kata VMM policy module is not
+     required while enforcement is off, so this step is skipped -- re-run the
+     installer once the host is Enforcing."
+    return 0
+  fi
+
+  local tool
+  for tool in semodule audit2allow checkmodule semodule_package; do
+    command -v "$tool" >/dev/null 2>&1 || die \
+"SELinux is Enforcing but '${tool}' is not installed, so the Kata VMM policy
+  module cannot be built. Install the provider and re-run:
+    sudo dnf install checkpolicy policycoreutils-python-utils
+  (semodule ships with policycoreutils; checkmodule ships with checkpolicy.)"
+  done
+
+  # The PID directory lives on tmpfs and may not exist until Kata first runs.
+  # Created when missing; an existing directory keeps its mode, because the
+  # failure observed was a MAC denial, not a DAC one.
+  if [[ ! -d /run/vc/vm ]]; then
+    install -d -m 0755 /run/vc/vm \
+      || die "Could not create /run/vc/vm, where QEMU writes its PID file."
+  fi
+
+  # Idempotent like label_paths: -a then -m, never a delete-first dance.
+  # /run is an equivalency alias of /var/run in the SELinux file contexts, so
+  # the spec must name /var/run/vc -- using /run/vc is refused as conflicting
+  # with the equivalency rule. Both names address the same tmpfs files.
+  semanage fcontext -a -t container_var_run_t "/var/run/vc(/.*)?" 2>/dev/null \
+    || semanage fcontext -m -t container_var_run_t "/var/run/vc(/.*)?" \
+    || die "Could not set the SELinux fcontext for /run/vc.
+     The path currently has no usable label; QEMU would be refused its PID file."
+  restorecon -RF /run/vc/vm 2>/dev/null \
+    || warn "restorecon failed for /run/vc/vm."
+
+  local module="secureai-kata"
+  local tmpdir
+  tmpdir="$(mktemp -d)" || die "Could not create a scratch directory."
+  # Every die below exits the script, so the scratch dir is reaped on any
+  # path out of here, not just the happy one at the end.
+  trap "rm -rf '$tmpdir'" EXIT
+
+  # Live denials first: audit2allow derives the exact source types from the
+  # running policy, which a shipped baseline can only guess at. Filtered to
+  # the VMM path so unrelated recent denials do not widen the module.
+  local live_avc="${tmpdir}/kata.avc"
+  if command -v ausearch >/dev/null 2>&1; then
+    ausearch -m avc -ts recent 2>/dev/null \
+      | grep -Ei 'qemu|virtiofsd|kata|vhost|/run/vc|io_uring' >"$live_avc" || true
+    if [[ ! -s "$live_avc" ]]; then
+      warn "ausearch -m avc -ts recent shows no kata/qemu denial, so the
+       baseline module for the three known VMM denials is installed. If a
+       session later wedges in Created, inspect live denials with:
+         ausearch -m avc -ts recent"
+    fi
+  else
+    : >"$live_avc"
+    warn "ausearch is not available, so the baseline module is installed.
+     Inspect denials on an enforcing host with:  ausearch -m avc -ts recent"
+  fi
+
+  build_baseline_module() {
+    cat >"${tmpdir}/${module}.te" <<'TEEOF'
+module secureai-kata 1.0;
+
+require {
+	type svirt_t;
+	type container_t;
+	type container_runtime_t;
+	type virtiofs_t;
+	type vhost_device_t;
+	type root_t;
+	class chr_file { read write open ioctl getattr lock map append };
+	class dir mounton;
+	class io_uring create;
+  }
+
+# qemu-system-x86_64 denied read/write on /dev/vhost-vsock (vhost_device_t).
+allow svirt_t vhost_device_t:chr_file { read write open ioctl getattr lock map append };
+allow container_t vhost_device_t:chr_file { read write open ioctl getattr lock map append };
+allow container_runtime_t vhost_device_t:chr_file { read write open ioctl getattr lock map append };
+
+# virtiofsd denied mounton on / (root_t).
+allow virtiofs_t root_t:dir mounton;
+allow svirt_t root_t:dir mounton;
+allow container_t root_t:dir mounton;
+allow container_runtime_t root_t:dir mounton;
+
+# qemu denied create on io_uring.
+allow svirt_t self:io_uring create;
+allow container_t self:io_uring create;
+allow container_runtime_t self:io_uring create;
+allow virtiofs_t self:io_uring create;
+TEEOF
+    checkmodule -M -m -o "${tmpdir}/${module}.mod" "${tmpdir}/${module}.te" \
+      && semodule_package -o "${tmpdir}/${module}.pp" -m "${tmpdir}/${module}.mod"
+  }
+
+  if [[ -s "$live_avc" ]]; then
+    # -M writes ${module}.te and ${module}.pp into the current directory, so
+    # the build runs with tmpdir as its cwd.
+    ( cd "$tmpdir" && audit2allow -M "$module" -i "$(basename "$live_avc")" ) >/dev/null 2>&1 \
+      || die "audit2allow could not build ${module} from the live denials in
+     ${live_avc}. Inspect them with:  ausearch -m avc -ts recent"
+  else
+    build_baseline_module || die \
+"Could not compile the baseline ${module} policy module.
+  Rebuild it from live denials after reproducing the failure:
+    ausearch -m avc -ts recent | audit2allow -M ${module}
+    sudo semodule -i ${module}.pp"
+  fi
+
+  # An older policy may lack a permission the baseline names (F38 has no
+  # io_uring create while the F44 denial needs it). Retry once without the
+  # io_uring block rather than failing the whole install; the remaining
+  # vhost and mounton rules still load, and the io_uring rule is regenerated
+  # from live denials on the host that actually denies it.
+  if ! semodule -i "${tmpdir}/${module}.pp" 2>"${tmpdir}/semodule.err"; then
+    if [[ ! -s "$live_avc" ]] && grep -q io_uring "${tmpdir}/${module}.te" 2>/dev/null; then
+      warn "The full baseline module was refused by this host policy; retrying
+       without the io_uring block. Details:
+         $(tail -2 "${tmpdir}/semodule.err" 2>/dev/null || true)"
+      sed -i '/io_uring/d' "${tmpdir}/${module}.te"
+      checkmodule -M -m -o "${tmpdir}/${module}.mod" "${tmpdir}/${module}.te" \
+        && semodule_package -o "${tmpdir}/${module}.pp" -m "${tmpdir}/${module}.mod" \
+        && semodule -i "${tmpdir}/${module}.pp" 2>"${tmpdir}/semodule.err" \
+        || die "The ${module} policy module was refused by semodule:
+     $(tail -3 "${tmpdir}/semodule.err" 2>/dev/null || true)
+  This host denies something outside the vhost/mounton baseline. Reproduce
+  the session failure, then build the module from live denials:
+    ausearch -m avc -ts recent | audit2allow -M ${module}
+    sudo semodule -i ${module}.pp"
+      warn "io_uring is not covered by the installed module on this host. If a
+       session later wedges in Created with an io_uring denial, regenerate:
+         ausearch -m avc -ts recent | audit2allow -M ${module}
+         sudo semodule -i ${module}.pp"
+    else
+      die "The ${module} policy module was refused by semodule:
+     $(tail -3 "${tmpdir}/semodule.err" 2>/dev/null || true)
+  Inspect live denials with:  ausearch -m avc -ts recent"
+    fi
+  fi
+  rm -f "${tmpdir}/semodule.err"
+
+  # semodule -l lists "name version" pairs, so an exact whole-line match on
+  # the bare name never hits; match the name field instead.
+  semodule -l 2>/dev/null | grep -Eq "^${module}([[:space:]]|$)" \
+    || die "The ${module} module is not listed by semodule -l after install.
+     Confirm with:  semodule -l | grep ${module}"
+  ok "${module} policy module loaded (see: semodule -l | grep ${module})"
+
+  local vm_label
+  vm_label="$(ls -ldZ /run/vc/vm 2>/dev/null || true)"
+  [[ -n "$vm_label" ]] || die \
+"/run/vc/vm is missing after the policy install, so QEMU has nowhere to write
+  its PID file. Confirm with:  ls -ldZ /run/vc/vm"
+  local vm_type
+  # stat reports the context directly, whatever shape ls takes; empty or ?
+  # means the context could not be read.
+  vm_type="$(stat -c %C /run/vc/vm 2>/dev/null | cut -d: -f3 || true)"
+  if [[ -z "$vm_type" || "$vm_type" == "?" ]]; then
+    vm_type="unknown"
+  fi
+  if [[ "$vm_type" != "container_var_run_t" ]]; then
+    die "/run/vc/vm carries '${vm_type:-unknown}', expected container_var_run_t:
+     ${vm_label}
+  Repair with:
+    sudo semanage fcontext -m -t container_var_run_t \"/var/run/vc(/.*)?\"
+    sudo restorecon -RF /run/vc/vm
+    ls -ldZ /run/vc/vm"
+  fi
+  # Owner write AND execute, as the CLI asserts: entering the directory and
+  # creating the PID file need both.
+  local vm_mode mode_ok
+  vm_mode="$(stat -c %a /run/vc/vm 2>/dev/null || echo unknown)"
+  mode_ok=0
+  if [[ "$vm_mode" =~ ^[0-7]+$ ]] && (( (8#$vm_mode & 0300) == 0300 )); then
+    mode_ok=1
+  fi
+  if [[ "$mode_ok" -ne 1 ]]; then
+    die "/run/vc/vm has mode ${vm_mode}, without owner write and execute, so
+  QEMU cannot create its PID file there. Observed:
+     ${vm_label}
+  Repair with:
+    sudo chmod 0755 /run/vc/vm
+    ls -ldZ /run/vc/vm"
+  fi
+  ok "/run/vc/vm is ${vm_type}, mode ${vm_mode}: ${vm_label}"
+
+  rm -rf "$tmpdir"
+}
+
+# =========================================================================
 verify_install() {
   log "Verifying the installation"
   [[ -x "$SECUREAI_BIN" ]] || die "${SECUREAI_BIN} is not executable."
@@ -720,6 +938,7 @@ main() {
   ensure_kata_guest_assets "${SECUREAI_KATA_CONFIG_PATH:-}"
   install_layout
   label_paths
+  ensure_kata_vmm_policy
   verify_install
 
   printf '\n\033[1;32mSecureAI installed.\033[0m\n\n'
