@@ -108,11 +108,27 @@ ensure_compose_env() {
 # `docker compose`. Compose reads them from the environment too, which is why
 # the same values are referenced as ${...} there and only here (AD-11).
 load_compose_env() {
+  # Per-launch workspace: cmd_opencode exports SECUREAI_WORKSPACE from `pwd -P`
+  # AFTER the first load and marks it with SECUREAI_WORKSPACE_PINNED=1. Every
+  # later compose() call re-sources compose.env, which would clobber that cwd
+  # with the static default. Preserve only the pinned cwd, never the
+  # compiled-in default, so an operator re-pin in compose.env still wins for
+  # every other command.
+  local _saved_workspace="${SECUREAI_WORKSPACE:-}"
+  local _pinned="${SECUREAI_WORKSPACE_PINNED:-}"
   ensure_compose_env
   set -a
   # shellcheck disable=SC1090
   . "$SECUREAI_COMPOSE_ENV"
   set +a
+  if [[ "${_pinned}" == "1" && -n "${_saved_workspace:-}" && "${_saved_workspace}" != "${SECUREAI_WORKSPACE:-}" ]]; then
+    if [[ -d "${_saved_workspace}" ]]; then
+      SECUREAI_WORKSPACE="${_saved_workspace}"
+    else
+      warn "Launch directory ${_saved_workspace} no longer exists; using ${SECUREAI_WORKSPACE} from ${SECUREAI_COMPOSE_ENV}."
+    fi
+  fi
+  export SECUREAI_WORKSPACE
   local name
   # Every value compose consumes and every host path the bind mounts bind to.
   # Missing any of these produces an opaque interpolation error from compose
@@ -1118,7 +1134,7 @@ cmd_opencode() {
   # /workspace. Refuse $HOME and / so SSH keys and credentials are never
   # exposed to the sandbox.
   {
-    local _cwd _home
+    local _cwd _home _invoker_home
     _cwd="$(pwd -P)"
     _home="$(cd ~ && pwd -P)"
     if [[ "$_cwd" == "$_home" || "$_cwd" == "/" ]]; then
@@ -1126,8 +1142,37 @@ cmd_opencode() {
   This would expose SSH keys and credentials to the sandbox.
   Run from a project subdirectory."
     fi
+    # Under sudo ~ is /root, so the invoking user's home would otherwise slip
+    # past the guard and expose its SSH keys when launching from exact $HOME.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+      _invoker_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+      if [[ -n "${_invoker_home}" && "$_cwd" == "$_invoker_home" ]]; then
+        die "Refusing to launch from ${_cwd}.
+  This would expose SSH keys and credentials to the sandbox.
+  Run from a project subdirectory."
+      fi
+    fi
+    # Never bind-mount key or CA state into the untrusted guest.
+    case "$_cwd" in
+      /etc/secureai|/etc/secureai/*|/var/lib/secureai|/var/lib/secureai/*|/opt/secureai|/opt/secureai/*|/etc|/etc/*)
+        die "Refusing to launch from ${_cwd}.
+  This would expose key or CA material to the sandbox.
+  Run from a project subdirectory."
+        ;;
+    esac
     SECUREAI_WORKSPACE="$_cwd"
     export SECUREAI_WORKSPACE
+    SECUREAI_WORKSPACE_PINNED=1
+    export SECUREAI_WORKSPACE_PINNED
+    # The guest runs as uid 1000 and host ownership shines through virtiofs;
+    # only the default workspace is chowned in cmd_init_config, so a cwd owned
+    # by another uid (e.g. root 0700) fails the agent's first write with EACCES.
+    # Warn here; never chown a user's project directory.
+    local _owner
+    _owner="$(stat -c %u "$_cwd" 2>/dev/null || echo unknown)"
+    if [[ "${_owner}" != "1000" && "${_owner}" != "unknown" ]]; then
+      warn "Launch directory ${_cwd} is owned by uid ${_owner}, but the guest runs as uid 1000; files may be unreadable or unwritable inside /workspace."
+    fi
   }
   assert_proxy_runtime_pinned
   assert_runtime_registered kata

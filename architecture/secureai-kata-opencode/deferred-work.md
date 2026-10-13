@@ -101,3 +101,7 @@
 - source_spec: `architecture/secureai-kata-opencode/spec-fix-secureai-kata-vm-boot-failure.md`
   summary: Settle QEMU-exit threshold and agent-crash distinction live (medium-unverified).
   evidence: The >=10s grace and exited-with-QEMU-running mapping are unit-tested with stubs; settles with a live F44 run showing fast QEMU exit vs slow shim start and agent-crash behavior.
+
+- source_spec: `architecture/secureai-kata-opencode/spec-fix-workspace-cwd-mount.md`
+  summary: Add a bash regression test for pinned workspace preserve across compose() calls.
+  evidence: Verified only with bash -n plus isolated snippet simulation; no harness covers save/restore, operator re-pin, or missing-cwd warn. Would be proven by a test driving load_compose_env twice in one process.
