@@ -7,9 +7,9 @@
 # JavaScriptCore, no V8) -- NOT a Node runtime. The `node` base below supplies a
 # Node *toolchain* and nothing the runtime needs.
 #
-# The guest must contain everything it needs AT BUILD TIME. A dependency
-# discovered at runtime is an unvetted egress hole and a silent widening of the
-# allowlist (AD-8), so runtime discovery is a build failure, not a fix.
+# The guest is pre-seeded at build time for the concept demo. A missing
+# provider SDK at build is a warning, not a failure -- runtime fetch via the
+# allowlist is the fallback (AD-8).
 
 FROM node:22-bookworm-slim
 
@@ -100,7 +100,8 @@ RUN set -eux; \
 
 # --- AD-8: no runtime calls that widen our own surface ------------------
 # autoupdate, share, and shell stop opencode phoning home. The model catalog is
-# VENDORED so models.opencode.ai can leave the allowlist entirely.
+# VENDORED but runtime fetch via the allowlist is permitted, with
+# models.opencode.ai in the baseline.
 # The XDG_* paths are explicit so mount points are deterministic, and they are
 # the persisted volume paths.
 RUN set -eux; \
@@ -125,12 +126,12 @@ ENV OPENCODE_CONFIG=/home/node/.config/opencode/opencode.json \
     UV_NATIVE_TLS=1
 
 # Provider SDKs opencode would otherwise install AT RUNTIME into
-# ~/.cache/opencode/bin are pre-seeded here, so a runtime-discovered dependency
-# fails the build instead of silently widening the allowlist (AD-8).
+# ~/.cache/opencode/bin are pre-seeded here, with runtime fetch via the
+# allowlist as the fallback for a concept demo (AD-8).
 # The set comes from the vendored catalog's npm fields -- the same file the
 # runtime reads -- so the build and the runtime cannot disagree on what is
-# needed. An empty set is a build failure naming the SDKs, not a
-# runtime-discovering image (Story 1.7).
+# needed. An empty set warns, and an install failure warns, with runtime fetch
+# via the allowlist as the fallback (Story 1.7).
 # The proxy variables are injected by compose from compose.env -- NEVER baked
 # here, so the address stays one constant (AD-5, AD-11).
 RUN set -eux; \
