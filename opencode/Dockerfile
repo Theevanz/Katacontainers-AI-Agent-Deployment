@@ -91,7 +91,7 @@ ENV NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/secureai-bundle.crt
 # real binary, and the postinstall hardlinks the native binary into place.
 # `opencode --version` must succeed HERE or the build fails, rather than
 # shipping a broken agent that only fails inside a VM.
-ARG OPENCODE_VERSION=1.18.34
+ARG OPENCODE_VERSION=1.19.0
 RUN set -eux; \
     npm install --global --no-audit --no-fund \
         "opencode-ai@${OPENCODE_VERSION}"; \

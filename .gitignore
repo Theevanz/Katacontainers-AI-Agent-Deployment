@@ -10,3 +10,20 @@ __pycache__/
 
 # Local VM images. Large per-machine artifacts, never source.
 *.qcow2
+*.qcow
+
+# Stray HOME emulation. Created when tools run with HOME set to the repo.
+# Real copies live in $HOME - never commit the repo-local duplicates.
+/.cache/
+/.config/
+/.docker/
+/.local/
+/.npm/
+/.ssh/
+.bash_history
+.bash_logout
+.bash_profile
+.bashrc
+.cshrc
+.tcshrc
+.pytest_cache/

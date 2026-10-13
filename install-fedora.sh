@@ -794,14 +794,19 @@ install_layout() {
   # 0700 on both: these hold key material and must not be traversable by the
   # unprivileged proxy container. The proxy's read access to its runtime copy is
   # granted by GROUP, not by relaxing these -- see cmd_init_config.
-  install -d -m 0700 "$SECUREAI_ETC" "$SECUREAI_VAR"
+  # 0711 on ETC (traverse-only): keys/policy stay 0640 root:root, but the
+  # world-readable compose.env (no secrets) must be sourceable rootless.
+  install -d -m 0711 "$SECUREAI_ETC"
+  install -d -m 0700 "$SECUREAI_VAR"
 
   # AD-11: the installer may CREATE compose.env but must never POPULATE it.
   # The CLI is its sole writer. Seeded empty so the file exists and is owned.
+  # 0644: compose.env holds no secrets (subnet, IPs, image names,
+  # placeholder key), and rootless sessions must be able to source it.
   if [[ ! -e "${SECUREAI_ETC}/compose.env" ]]; then
     : >"${SECUREAI_ETC}/compose.env"
     chown root:root "${SECUREAI_ETC}/compose.env"
-    chmod 0640 "${SECUREAI_ETC}/compose.env"
+    chmod 0644 "${SECUREAI_ETC}/compose.env"
   else
     # Migrate a stale proxy GID from pre-2026-10-08 installs (10001). The proxy
     # image runs as the base image's canonical 1000:1000, so any other gid
@@ -826,11 +831,13 @@ install_layout() {
   if [[ ! -e "${SECUREAI_ETC}/keys.yaml" && -f "${SECUREAI_APP_DIR}/config/keys.yaml.template" ]]; then
     install -m 0640 "${SECUREAI_APP_DIR}/config/keys.yaml.template" "${SECUREAI_ETC}/keys.yaml"
   fi
-  # /etc/secureai stays root:root 0700 -- it is the source of truth, and the
-  # proxy never reads it directly. Only the runtime COPY under /var/lib is
-  # re-grouped for the proxy, and it stays deny-all to everyone else (AD-7).
+  # /etc/secureai stays root:root 0711 (traverse-only) -- it is the source
+  # of truth, and the proxy never reads it directly. Keys/policy stay 0640;
+  # only compose.env (no secrets) is 0644 so rootless sessions can source it.
+  # Only the runtime COPY under /var/lib is re-grouped for the proxy, and it
+  # stays deny-all to everyone else (AD-7).
   chown -R root:root "$SECUREAI_ETC"
-  chmod 0700 "$SECUREAI_ETC"
+  chmod 0711 "$SECUREAI_ETC"
   install -d -m 0750 -o root -g 1000 "$SECUREAI_VAR"
   install -d -m 2770 -o root -g 1000 "${SECUREAI_VAR}/ca"
   chown -R root:1000 "$SECUREAI_VAR"
@@ -1217,11 +1224,11 @@ main() {
     2. Store a key. The value is masked by every read-back:
          sudo secureai keys set api.anthropic.com sk-ant-...
 
-    3. Start a session:
-         sudo secureai opencode
+    3. Start a session (no sudo -- docker group membership is enough):
+         secureai opencode
 
     4. Prove the isolation rather than assuming it:
-         sudo secureai verify
+         secureai verify
 
   See: secureai status | secureai whitelist list | secureai down
 EOF

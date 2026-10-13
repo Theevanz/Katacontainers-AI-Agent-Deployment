@@ -54,28 +54,28 @@ Installs machine-wide and root-owned. There is no `git clone` prerequisite and n
 per-user variant — the checkout is never referenced at runtime. Re-running is
 idempotent.
 
-After install, the image build needs the CA first, and every command that writes
-root-owned config needs sudo:
+After install, the image build needs the CA first. Privileged setup needs
+sudo; everyday sessions do not (docker group membership is enough):
 
 ```bash
-sudo secureai ca export   # produce the interception CA
-sudo secureai build       # build proxy + guest images (bakes the CA in)
-sudo secureai opencode    # start a session
+sudo secureai ca export   # produce the interception CA (privileged, once)
+sudo secureai build       # build proxy + guest images (privileged, once)
+secureai opencode    # start a session (no sudo)
 ```
 
 ## Use
 
 ```bash
-sudo secureai opencode                 # launch an interactive session
+secureai opencode                 # launch an interactive session (no sudo)
 sudo secureai whitelist add example.com # allow an extra domain (live, no restart)
 secureai whitelist list            # show current allowlist
 sudo secureai keys set api.anthropic.com sk-ant-...   # store a key
 secureai keys list                 # show hosts, values masked
 sudo secureai ca export            # export the mitm CA (must run before image build)
 sudo secureai build                # build proxy + guest images
-sudo secureai verify               # run the gates and the open-question probes
+secureai verify               # run the gates and the open-question probes
 secureai status                    # check if the stack is running
-sudo secureai down                 # stop and remove containers
+secureai down                 # stop and remove containers
 ```
 
 The user never types `docker`. Config lives in `/etc/secureai` (`0640 root:root`) and
@@ -148,7 +148,7 @@ mount or the CLI uses is one of these five.
 ```
 /usr/local/bin/secureai   # the single entry point, the only thing on your PATH
 /opt/secureai/            # root-owned app tree: compose, Dockerfiles, addon, config
-/etc/secureai/            # 0700 — sole source of truth, CLI-written
+/etc/secureai/            # 0711 traverse-only — sole source of truth, CLI-written
 /var/lib/secureai/        # 0700 — runtime copy, ca.pem, session workspace
 ```
 

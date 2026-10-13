@@ -59,6 +59,11 @@ need_root() {
  Run this command with sudo, e.g.  sudo secureai ${1:-<command>}."
 }
 
+# Rootless sessions: `opencode`, `down`, `status`, `verify` and the read-only
+# list commands run as the invoking user (docker group is enough). Only the
+# mutating commands (whitelist add, keys set, ca export, build) need root.
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+
 need_docker() {
   command -v docker >/dev/null 2>&1 || die \
 "docker was not found on PATH.
@@ -76,10 +81,19 @@ need_docker() {
 # populate, and the CLI is its sole writer) -- so "file exists" alone must not
 # suppress the seed; the seed must also land when the file is EMPTY.
 ensure_compose_env() {
+  # Rootless path: never write root-owned config. compose.env holds no
+  # secrets (subnet, IPs, image names, placeholder key), so it is
+  # world-readable (0644) and a session only needs to source it.
+  if ! is_root; then
+    [[ -s "$SECUREAI_COMPOSE_ENV" ]] || die \
+"${SECUREAI_COMPOSE_ENV} is missing or empty, and this shell cannot create it.
+ Run once with sudo (e.g. sudo secureai status), then re-run without sudo."
+    return 0
+  fi
   if [[ ! -s "$SECUREAI_COMPOSE_ENV" ]]; then
     local template="${SECUREAI_APP_DIR}/config/compose.env"
     if [[ -f "$template" ]]; then
-      install -m 0640 "$template" "$SECUREAI_COMPOSE_ENV"
+      install -m 0644 "$template" "$SECUREAI_COMPOSE_ENV"
       ok "seeded ${SECUREAI_COMPOSE_ENV}"
     else
       die "${SECUREAI_COMPOSE_ENV} is missing and no template was found at
@@ -100,7 +114,7 @@ ensure_compose_env() {
       ok "migrated SECUREAI_PROXY_GID to 1000 in ${SECUREAI_COMPOSE_ENV}"
     fi
   fi
-  chmod 0640 "$SECUREAI_COMPOSE_ENV" 2>/dev/null || true
+  chmod 0644 "$SECUREAI_COMPOSE_ENV" 2>/dev/null || true
   chown root:root "$SECUREAI_COMPOSE_ENV" 2>/dev/null || true
 }
 
@@ -188,8 +202,31 @@ sync_to_runtime() {
 # =========================================================================
 
 cmd_init_config() {
+  # Rootless path (sessions, status, down, verify, list): never touch
+  # root-owned config. The privileged setup (sudo build / sudo keys set /
+  # sudo whitelist add) must have run once; here just verify its outputs
+  # are visible: compose.env readable, and the runtime copies the proxy
+  # actually reads exist under /var/lib.
+  if ! is_root; then
+    ensure_compose_env
+    local _missing=""
+    local _f
+    for _f in whitelist.yaml settings.yaml keys.yaml; do
+      if [[ ! -f "${SECUREAI_VAR}/${_f}" && ! -r "${SECUREAI_ETC}/${_f}" ]]; then
+        _missing="${_missing} ${_f}"
+      fi
+    done
+    if [[ -n "${_missing}" ]]; then
+      die "SecureAI is not initialised (missing:${_missing}).
+ Run once with sudo (e.g. sudo secureai build), then re-run without sudo."
+    fi
+    return 0
+  fi
   log "Initialising SecureAI configuration in ${SECUREAI_ETC}"
-  install -d -m 0700 -o root -g root "$SECUREAI_ETC"
+  # 0711 root:root (traverse-only): the source of truth stays unreadable
+  # (keys/policy files are 0640 root:root), but a rootless session must be
+  # able to source the world-readable compose.env (0644, no secrets) by path.
+  install -d -m 0711 -o root -g root "$SECUREAI_ETC"
   # 0750 root:proxy -- the /var/lib/secureai directory holds the runtime copy
   # that the proxy bind-mounts. The proxy runs as a non-root user (gosu-drop),
   # so a 0700 root:root directory would be unreadable by the very process that
@@ -276,6 +313,19 @@ cmd_init_config() {
       chmod 0644 "$caf" 2>/dev/null || true
     done
   fi
+  # Session state for rootless runs: proxy.log and the timing records live
+  # under /var/lib (paths the tests pin), but a non-root invoker cannot
+  # create them in a 0750 root-owned dir. Pre-create them here -- this
+  # branch only runs as root -- group-writable so `: >`, `>>` and `cp`
+  # in cmd_opencode/teardown work without sudo. Key/policy files above
+  # stay 0640; only these append/truncate session logs are opened up.
+  local _sf
+  for _sf in proxy.log last-session-timing.txt last-session-timing-cold.txt \
+             last-session-timing-warm.txt session-timing-history.log whitelist.audit.log; do
+    [[ -e "${SECUREAI_VAR}/${_sf}" ]] || : >"${SECUREAI_VAR}/${_sf}"
+    chown root:"$SECUREAI_PROXY_GID" "${SECUREAI_VAR}/${_sf}" 2>/dev/null || true
+    chmod 0660 "${SECUREAI_VAR}/${_sf}" 2>/dev/null || true
+  done
   ok "configuration ready and mirrored to ${SECUREAI_VAR}"
 }
 
@@ -400,9 +450,13 @@ cmd_keys_set() {
 
 cmd_keys_list() {
   cmd_init_config >/dev/null 2>&1 || true
+  # Prefer the source of truth, fall back to the runtime copy the proxy
+  # reads: a rootless invoker cannot read 0700 /etc/secureai but can read
+  # the group-readable /var/lib copy. Values are only ever printed masked.
   local keys_file="${SECUREAI_ETC}/keys.yaml"
+  [[ -r "$keys_file" ]] || keys_file="${SECUREAI_VAR}/keys.yaml"
   [[ -r "$keys_file" ]] || die \
-"${keys_file} is not readable. Either it does not exist, or this shell is not
+"${SECUREAI_ETC}/keys.yaml is not readable. Either it does not exist, or this shell is not
  privileged enough to read root-only config. Run this command with sudo."
   [[ -f "$keys_file" ]] || {
     warn "No keys file yet. Add one with: secureai keys set <host> <key>"
@@ -410,7 +464,7 @@ cmd_keys_list() {
   }
 
   local pairs found=0
-  pairs="$(yaml_pairs "${SECUREAI_ETC}/keys.yaml")"
+  pairs="$(yaml_pairs "$keys_file")"
   [[ -n "$pairs" ]] || { warn "No keys configured."; return 0; }
 
   log "Stored keys (values masked)"
@@ -547,7 +601,7 @@ cmd_build() {
  If the error mentions the toolchain, you are probably not on a Debian glibc
  base -- but you should never see that, because this Dockerfile base is pinned."
   ok "guest image built with the interception CA baked in"
-  printf '\n  You are ready. Start a session with:  sudo secureai opencode\n'
+  printf '\n  You are ready. Start a session with:  secureai opencode\n'
 }
 
 # --- session lifecycle (AD-14) -------------------------------------------
@@ -609,14 +663,27 @@ assert_proxy_runtime_pinned() {
 # Declared-but-unregistered runtimes fail the session with a readable message
 # rather than a raw Docker error (Story 2.3).
 assert_runtime_registered() {
-  local name="$1"
-  timeout 10 docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q "\"$name\"" \
-    || die \
+  local name="$1" runtimes
+  # A daemon this shell cannot reach (not in the docker group, daemon down)
+  # reports the same empty grep as a missing runtime -- distinguish them, or
+  # a permissions problem surfaces as "no runtime named kata" and sends the
+  # operator to reinstall instead of to `usermod -aG docker`.
+  if ! runtimes="$(timeout 10 docker info --format '{{json .Runtimes}}' 2>/dev/null)"; then
+    die \
+"Cannot reach the Docker daemon as '${USER:-this user}'.
+ If the daemon is running, this shell lacks permission to talk to it: join
+ the docker group, then log out and back in so it takes effect:
+   sudo usermod -aG docker '${USER:-<user>}'
+ Then re-run 'secureai status' to confirm the pairing."
+  fi
+  if ! grep -q "\"$name\"" <<<"$runtimes"; then
+    die \
 "Docker has no runtime named '${name}' registered on this host.
  A Kata session cannot start until install-fedora.sh has wired it into
  /etc/docker/daemon.json and Docker has been restarted:
    sudo systemctl restart docker
  Then re-run 'secureai status' to confirm the pairing."
+  fi
   ok "runtime '${name}' is registered"
 }
 
@@ -746,6 +813,17 @@ assert_kata_guest_assets() {
 # The path is a parameter so the check can be executed against a fixture.
 assert_kata_vmm_path() {
   local pid_dir="${1:-${SECUREAI_KATA_VM_DIR:-/run/vc/vm}}"
+  # Rootless softening for the DEFAULT path only: a 0750 root-owned
+  # /run/vc/vm reads as "missing" to [[ -d ]] without root, so a strict gate
+  # would fail every rootless session with the wrong diagnosis. Warn and
+  # continue -- QEMU/shim run as root, only sudo can repair this anyway
+  # ('sudo secureai status' shows it), and a truly missing dir still wedges
+  # loudly under the boot watchdog. Explicit targets (tests, debugging) and
+  # privileged runs stay strict.
+  if [[ -z "${1:-}" ]] && ! is_root && [[ ! -d "$pid_dir" ]]; then
+    warn "Cannot verify ${pid_dir} without root; continuing. Check with: sudo secureai status"
+    return 0
+  fi
   local sel_mode label_line vm_type mode_bits mode_ok
   sel_mode="$(getenforce 2>/dev/null || echo unknown)"
   label_line="$(ls -ldZ "$pid_dir" 2>/dev/null || echo missing)"
@@ -1126,7 +1204,9 @@ cmd_opencode() {
   elif [[ -n "${1:-}" ]]; then die "usage: secureai opencode [--cold|--warm]
   '${1}' is not a session kind; timing records are labeled cold or warm, so an
   unrecognized flag would mislabel the measurement."; fi
-  need_root
+  # Rootless by design: a session needs docker group membership, not root.
+  # Privileged setup (keys, CA, images) must have run once via sudo; the
+  # rootless cmd_init_config above verifies that instead of requiring it.
   need_docker
   cmd_init_config >/dev/null
   load_compose_env
@@ -1221,7 +1301,7 @@ cmd_opencode() {
       timeout 60 docker rm -f "$stale" >/dev/null 2>&1 || die \
 "A leftover container named '${stale}' could not be removed, so this session
  cannot claim the name. Remove it by hand, then re-run:
-   sudo docker rm -f ${stale}"
+   docker rm -f ${stale}"
       ok "removed a leftover '${stale}' from a previous session"
     fi
   done
@@ -1819,7 +1899,7 @@ usage: secureai <command> [arguments]
                            probes. Reports UNVERIFIED rather than guessing.
   help                     This message.
 
-Configuration lives in ${SECUREAI_ETC} (0700) and is written only by this CLI.
+Configuration lives in ${SECUREAI_ETC} (0711 traverse-only, files 0640) and is written only by this CLI.
 Runtime state, including the CA and the synced config the proxy reads, lives in
 ${SECUREAI_VAR} (0700).
 EOF
