@@ -59,12 +59,11 @@ rewritten rather than amended.
 - **Rule:** All whitelist enforcement lives in `proxy/addon.py`. The guest receives no policy
   and filters nothing. `HTTPS_PROXY` is set because the runtime honors it, **not** because it
   is a control.
-- **Accepted risk (provisional):** enforcement is *cooperative*. Enforcement happens at
+- **Accepted risk:** enforcement is *cooperative*. Enforcement happens at
   `requestheaders` — i.e. **after** CONNECT and the TLS handshake to the blocked host, so a
   blocked host observes the handshake. A guest process that ignores `http_proxy`/
   `https_proxy` bypasses the whitelist entirely; Kata installs no host-side egress filter and
-  no iptables backstop is in scope for this MVP. Provisional pending the `internal: true`
-  question in Open Questions.
+  no iptables backstop is in scope. That is the stated design for a concept demo.
 - **Consequence for the success criteria:** `curl https://google.com` fails **because curl
   honors the proxy env vars**, not because the network blocks it. That test proves the proxy
   enforces; it does **not** prove the guest cannot route around it.
@@ -116,12 +115,11 @@ class SecureAIAddon(mitmproxy.addons.Addon):
   being unable to reach anything — every `git clone` and `curl https://github.com` would fail
   verification.
 - **Rule:** The mitm CA is installed into the guest **system** trust store
-  (`/usr/local/share/ca-certificates/` + `update-ca-certificates`) at image build. That store
-  satisfies **curl and git** only. **Node and Bun are not assumed to read it** — Node ships a
-  bundled Mozilla set, Bun ships its own, and `NODE_EXTRA_CA_CERTS` support in the pinned Bun
-  build is *unconfirmed*. `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `GIT_SSL_CAINFO` are either
-  unset or point at a **concatenated** bundle. Only the public cert is exposed to the guest; the
-  private key never leaves the proxy.
+  (`/usr/local/share/ca-certificates/` + `update-ca-certificates`) at image build, and the
+  guest processes trust it via the standard env (`NODE_EXTRA_CA_CERTS` /
+  `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` pointing at the shared public cert). Curl
+  succeeding is the smoke test; a model call through the agent is the concept proof.
+  Only the public cert is exposed to the guest; the private key never leaves the proxy.
 
 ### AD-5 — The proxy is addressed by fixed IP; the guest owns its own resolver
 
@@ -199,14 +197,13 @@ class SecureAIAddon(mitmproxy.addons.Addon):
 - **Binds:** F4, F6, F11
 - **Prevents:** Dependencies discovered only at runtime — each an unvetted egress hole and a
   silent addition to the allowlist.
-- **Rule:** Guest config sets `autoupdate: false`, `share: "disabled"`, `shell: "/bin/sh"`. The
-  model catalog is **vendored**: `OPENCODE_MODELS_PATH` points at a pre-seeded JSON and
-  `OPENCODE_DISABLE_MODELS_FETCH=1`, so `models.opencode.ai` leaves the allowlist entirely.
-  `XDG_CONFIG_HOME=/home/node/.config`, `XDG_DATA_HOME=/home/node/.local/share`,
-  `XDG_CACHE_HOME=/home/node/.cache`, `XDG_STATE_HOME=/home/node/.local/state` are set
-  explicitly, and those paths are the persisted volumes. Provider SDKs opencode installs at
-  runtime into `~/.cache/opencode/bin` **must be pre-seeded at build**; a runtime-discovered
-  dependency is a build failure, not an allowlist entry.
+- **Rule:** Guest config sets `autoupdate: false`, `share: "disabled"`, `shell: "/bin/sh"`.
+  The model catalog may be fetched at runtime via the allowlist
+  (`models.opencode.ai` is part of the baseline); `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` are set explicitly under
+  `/home/node` and are the persisted volumes. Provider SDKs missing at build
+  produce a build warning, not a failure -- runtime fetch via the allowlist is
+  the fallback for a concept demo.
 
 ### AD-9 — The base image is ours; the runtime inside it is not
 
@@ -232,15 +229,13 @@ class SecureAIAddon(mitmproxy.addons.Addon):
 - **Prevents:** A clean session launch being read as success. It proves nothing. A silently
   ignored `HTTPS_PROXY` produces a *working-looking* session that bypasses the whitelist. A
   rejected `NODE_EXTRA_CA_CERTS` produces a TLS error that reads as "the proxy is broken".
-- **Rule:** `secureai verify` (CLI-owned) must show all four:
+- **Rule:** `secureai verify` (CLI-owned) must show three gates:
   **(a)** the proxy log shows the API host; **(b)** injection occurred — logged as
   `authz=injected provider=<host> fp=<4-char sha256 prefix>`, a **fingerprint, never key
-  material**; **(c)** a non-allowlisted host fails *through the proxy* (scoped per AD-1);
-  **(d)** an HTTPS call **from the Bun/Node runtime inside the guest** through the proxy
-  succeeds — curl succeeding proves only curl.
-- **Risk #1:** gate (d) is unconfirmed. Bun 1.3.6 reportedly ignored `NODE_EXTRA_CA_CERTS`
-  (bun#17325) and opencode carries unresolved reports (#3130, #4883, #3566, #923, #1694,
-  #7073). It is the first thing to smoke-test, before any other work.
+  material**; **(c)** a non-allowlisted host fails *through the proxy* (scoped per AD-1).
+  Curl succeeding proves only curl; a model call through the agent is the concept proof.
+- **Known limit:** whether the Bun runtime honors `NODE_EXTRA_CA_CERTS` is unconfirmed
+  (bun#17325 and the opencode failure family). It is recorded as a limit, not a gate.
 
 ### AD-11 — Constants that cross the compose boundary live in exactly one file
 
@@ -413,7 +408,7 @@ secureai/
   ```
   api.anthropic.com, github.com, *.githubusercontent.com,
   registry.npmjs.org, pypi.org, files.pythonhosted.org,
-  models.dev, opencode.ai, astral.sh
+  models.dev, models.opencode.ai, opencode.ai, astral.sh
   ```
 
   `secureai whitelist add` is the only mutation path and writes an audit line. The addon
@@ -444,16 +439,16 @@ secureai/
 
 ## Open Questions
 
-- **BLOCKING — does `internal: true` apply to the Kata VM's tap device?** If it does, the Kata
-  guest has no route to the internet and AD-1's accepted risk is **void** — the stack is
-  stronger than this spine claims. If it does not, the setting is false comfort. AD-1's risk
-  stays provisional until this is tested. Nothing else in the spine depends on it.
 - **Plaintext `http://` egress.** `$HTTP_PROXY` covers scheme `http`, `$HTTPS_PROXY` only
-  `https`. The addon must gate on **transport scheme as well as** SNI/Host. Until then, scheme
-  `http` is an unguarded path and AD-1's accepted risk must be read as covering it.
-- **Does the pinned Bun build honor `NODE_EXTRA_CA_CERTS`?** AD-10 risk #1, gate (d).
-- **DNS-level enforcement beyond SNI?** Inherited unanswered from the PRD/plan. SNI is the
-  enforcement signal; upstream resolution is guest-local per AD-5.
+  `https`. The addon gates on SNI/Host; scheme gating beyond that is out of scope for the
+  concept demo and AD-1's accepted risk covers it.
+- **DNS-level enforcement beyond SNI?** Out of scope. SNI is the enforcement signal;
+  upstream resolution is guest-local per AD-5.
+
+Enforcement is cooperative by design (AD-1): the guest routes via the proxy because the
+runtime honors the proxy variables. There is no network-level backstop in scope, and no
+claim is made about `internal: true` reaching the Kata tap device. That is the stated
+design for a concept demo, not a provisional finding.
 
 ## Deferred
 

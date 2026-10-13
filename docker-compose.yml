@@ -104,6 +104,11 @@ services:
     # (AD-14). The CLI supplies -it.
     stdin_open: true
     tty: true
+    # The launch directory is the only host content the guest sees (concept
+    # demo: host `ls` == guest `ls /workspace`, siblings invisible, `uname -r`
+    # differs). The CLI exports SECUREAI_WORKSPACE from `pwd -P` and refuses
+    # $HOME and / so keys are never exposed.
+    working_dir: /workspace
     depends_on:
       proxy:
         # The agent must not start until the proxy can actually serve, so the
@@ -135,9 +140,13 @@ services:
       XDG_CACHE_HOME: /home/node/.cache
       XDG_STATE_HOME: /home/node/.local/state
     volumes:
-      # Session workspace is the only guest path. No /config mount: the guest
-      # must never see keys or the CA private key (AD-1, AD-12, NFR1).
-      - ${SECUREAI_WORKSPACE}:/home/node/.local/share/opencode:Z
+      # The launch directory, mounted as /workspace. Shared label (:z, not :Z)
+      # because host and guest share it; :Z would relabel the user's project
+      # private to the guest. No /config mount: the guest must never see keys
+      # or the CA private key (AD-1, AD-12, NFR1).
+      - ${SECUREAI_WORKSPACE}:/workspace:z
+      - opencode-config:/home/node/.config/opencode
+      - opencode-data:/home/node/.local/share/opencode
     networks:
       secureai_net:
         ipv4_address: ${SECUREAI_OPENCODE_IP}
@@ -156,9 +165,11 @@ networks:
     ipam:
       config:
         - subnet: ${SECUREAI_SUBNET}
-    # OPEN: whether `internal: true` applies to the Kata VM's tap device is the
-    # BLOCKING question of the whole design. If it does, the guest has no route
-    # out and AD-1's accepted risk is void. If it does not, this is false
-    # comfort. It is deliberately LEFT UNSET rather than set to a guessed value:
-    # `secureai verify` measures the effect of flipping it (Story 5.5), and a
-    # guessed setting would read as a guarantee that was never measured.
+    # Enforcement is cooperative (AD-1): the guest routes via the proxy because
+    # the runtime honors the proxy variables. No `internal: true` claim is made
+    # here -- whether it reaches the Kata tap device is unproven and out of
+    # scope for the concept demo.
+
+volumes:
+  opencode-config:
+  opencode-data:

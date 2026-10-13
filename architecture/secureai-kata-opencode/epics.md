@@ -65,7 +65,7 @@ FR35: Guest config disables outbound self-widening: `autoupdate: false`, `share:
 FR36: XDG_CONFIG_HOME=/home/node/.config, XDG_DATA_HOME=/home/node/.local/share, XDG_CACHE_HOME=/home/node/.cache, XDG_STATE_HOME=/home/node/.local/state are set explicitly, and those paths are the persisted volumes.
 FR37: Provider SDK binaries opencode would otherwise install at runtime into ~/.cache/opencode/bin are PRE-SEEDED at build. A runtime-discovered dependency is a build failure, not an allowlist entry.
 FR38: /etc/secureai/compose.env (0640, root) holds SECUREAI_SUBNET, SECUREAI_GATEWAY, SECUREAI_PROXY_IP, SECUREAI_PROXY_PORT, SECUREAI_PLACEHOLDER_KEY — and is the SOLE source for these constants. docker-compose.yml references them as `${...}` only; the CLI sources the same file before invoking docker compose. install-fedora.sh may create the file but not populate it; the CLI is its sole writer.
-FR39: The allowlist is seeded by the CLI with the exact reviewed AD-15 baseline: api.anthropic.com, github.com, *.githubusercontent.com, registry.npmjs.org, pypi.org, files.pythonhosted.org, models.dev, opencode.ai, astral.sh. The addon contains NO default-allow and NO host literal.
+FR39: The allowlist is seeded by the CLI with the exact reviewed AD-15 baseline: api.anthropic.com, github.com, *.githubusercontent.com, registry.npmjs.org, pypi.org, files.pythonhosted.org, models.dev, models.opencode.ai, opencode.ai, astral.sh. The addon contains NO default-allow and NO host literal.
 FR40: `secureai verify` shows all four gates: (a) the proxy log shows the API host; (b) injection occurred, logged with a fingerprint; (c) a non-allowlisted host fails THROUGH THE PROXY; (d) an HTTPS call from the Bun/Node runtime INSIDE THE GUEST through the proxy succeeds. curl succeeding proves only curl.
 FR41: Bind mount labels follow CONSUMER COUNT, where consumer means a compose service: `:Z` for a single-consumer mount, `:z` for two or more. No unlabelled bind read is permitted on an enforcing host. No `context=` mount option is ever passed.
 FR42: The proxy addon file is world-readable in the proxy image, because the mitmproxy entrypoint gosu-drops to the `mitmproxy` user with HOME=/home/mitmproxy.
@@ -452,11 +452,11 @@ So that the guest image can bake system trust instead of taking a runtime bind m
 **And** the CA is never bind-mounted into a running container
 **And** only the public certificate ever reaches the guest; the private key never leaves the proxy container
 
-### Story 1.7: Guest image with toolchain, vendored catalog, and fixed-IP network contract
+### Story 1.7: Guest image with toolchain, baked CA, and fixed-IP network contract
 
 As a developer,
 I want an agent image that already contains everything it needs and reaches the proxy by fixed IP,
-So that the agent works without discovering dependencies at runtime.
+So that the agent works for the concept demo.
 
 **Acceptance Criteria:**
 
@@ -464,37 +464,18 @@ So that the agent works without discovering dependencies at runtime.
 **When** I build the opencode image
 **Then** the base is `node:22-bookworm-slim` (glibc) and `git`, `python3`, `python3-pip`, `default-jdk-headless`, `ripgrep`, `jq`, `curl`, `openssh-client`, and `uv` are installed explicitly under a non-root `node` user (UID 1000), with `UV_LINK_MODE=copy` and `UV_NATIVE_TLS=1` (AD-9)
 **And** `opencode-ai@1.18.34` is installed from the **glibc** package — never `-musl` — with scripts enabled, and `opencode --version` succeeds in the build layer or the build fails
-**And** the mitm CA is installed to `/usr/local/share/ca-certificates/` with `update-ca-certificates`; `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, and `GIT_SSL_CAINFO` are unset or point at a **concatenated** bundle, never at the mitm CA alone (AD-4)
-**And** guest config sets `autoupdate: false`, `share: "disabled"`, `shell: "/bin/sh"`, with the model catalog **vendored** through `OPENCODE_MODELS_PATH` and `OPENCODE_DISABLE_MODELS_FETCH=1`, so `models.opencode.ai` is not required at runtime (AD-8)
-**And** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` are set explicitly under `/home/node` and are the persisted volume paths
-**And** provider SDK binaries opencode would otherwise install at runtime into `~/.cache/opencode/bin` are **pre-seeded at build**, so a runtime-discovered dependency fails the build rather than widening the allowlist
+**And** the mitm CA is installed to `/usr/local/share/ca-certificates/` with `update-ca-certificates`, and the guest trusts it via the standard CA env (AD-4)
+**And** guest config sets `autoupdate: false`, `share: "disabled"`, `shell: "/bin/sh"`
+**And** the model catalog may be fetched at runtime via the allowlist (`models.opencode.ai` is part of the baseline); a missing provider SDK at build is a warning, not a failure
+**And** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` are set explicitly under `/home/node`
 **And** the guest env carries `HTTPS_PROXY=http://${SECUREAI_PROXY_IP}:${SECUREAI_PROXY_PORT}` sourced from `compose.env`, never a compose service name (AD-5)
 **And** `NO_PROXY=localhost,127.0.0.1,::1` is set in the guest env
-**And** `docker-compose.yml` sets `dns:` on the opencode service to public resolvers (the bridge gateway runs no DNS), and `opencode/Dockerfile` does not bake `/etc/resolv.conf`
-**And** no Docker embedded resolver address (`127.0.0.11`) is referenced anywhere in the tree
-**And** `/etc/secureai/compose.env` (0640 root) is the sole source of `SECUREAI_SUBNET`, `SECUREAI_GATEWAY`, `SECUREAI_PROXY_IP`, `SECUREAI_PROXY_PORT`, and `SECUREAI_PLACEHOLDER_KEY`; every other reference is `${...}`, and no literal copy of any of the five exists outside that file (AD-11)
+**And** `docker-compose.yml` sets `dns:` on the opencode service to public resolvers, and `opencode/Dockerfile` does not bake `/etc/resolv.conf`
 **And** the CLI is bash throughout — `yq` is not used and no new language dependency is introduced (FR43)
 
-### Story 1.8: One name for each thing, greppable
+### Story 1.8: One name for each thing, greppable — REMOVED (out of scope for concept demo)
 
-As a developer working in this codebase,
-I want every artifact to follow one fixed naming convention,
-So that I can find any component by its name without reading the whole tree.
-
-**Acceptance Criteria:**
-
-**Given** the installed tree
-**When** I enumerate the artifacts
-**Then** the CLI binary is `secureai` at `/usr/local/bin/secureai`
-**And** the compose project and bridge network are `secureai` and `secureai_net`
-**And** the compose services are singular nouns — `proxy` and `opencode` — never `proxies`, `opencodes`, or `agent`
-**And** every environment constant carries the `SECUREAI_` prefix and is declared in `compose.env` (FR38)
-**And** config files are `whitelist.yaml`, `settings.yaml`, `keys.yaml`, and `keys.yaml.template` under `/etc/secureai`
-**And** runtime state is `ca.pem` and `ca/` alongside the synced config under `/var/lib/secureai`
-**And** the proxy addon lives at `proxy/addon.py` and its class is `SecureAIAddon`, named for behaviour rather than implementation
-**And** injection is logged with the `authz=` prefix and each blocked flow produces exactly one structured line (FR11, AR19)
-**And** the convention is verifiable by grep: searching the tree for `secureai_net`, `SecureAIAddon`, and `SECUREAI_` finds no variant spellings, plurals, or abbreviations
-**And** no file introduces a name that contradicts this set without also updating it here (AR23)
+Naming hygiene with zero demo value. Dropped permanently 2026-10-13; no code impact.
 
 ## Epic 2: Key Custody & Transparent Interception
 
@@ -573,28 +554,20 @@ So that the agent can use my subscription without ever holding the credential.
 **And** the guest's own environment contains the placeholder and nothing else, so keys never flow from the trusted zone back into the guest
 **And** with `content-type: text/event-stream` on the response, `.stream = True` is set in `responseheaders` **before any body is read**, so tokens are emitted rather than buffered until opencode's timeout (AD-3)
 
-### Story 2.5: The guest trusts the proxy without losing public HTTPS
+### Story 2.5: The guest trusts the proxy
 
 As a developer,
-I want the agent's runtime to trust the proxy while still reaching the public internet,
-So that interception works and nothing else breaks.
+I want the agent to trust the proxy,
+So that interception works for the demo.
 
 **Acceptance Criteria:**
 
 **Given** the built guest image
 **When** I inspect the trust configuration
-**Then** the mitm CA is present in the **system** trust store and satisfies `curl` and `git`
-**And** no variable points `SSL_CERT_FILE` at the mitm CA alone — the default bundle is extended, never replaced (AD-4)
-**And** `NODE_EXTRA_CA_CERTS` is set at process start with an absolute path, never after launch
-**And** a public HTTPS call from inside the guest — such as `git clone` from `github.com` — succeeds, proving the default bundle survived
-**And** opencode's lack of TLS pinning is recorded as the reason substitution is safe (AR16)
-
-> **⚠️ Highest risk in the project (AD-10 risk #1).** Whether the pinned Bun build honors
-> `NODE_EXTRA_CA_CERTS` is **unconfirmed**: Bun 1.3.6 reportedly ignored it (bun#17325), and
-> opencode issues #3130, #4883, #3566, #923, #1694, and #7073 are the same failure family. The
-> spine names this the **first thing to smoke-test, before any other work**. If Bun ignores it,
-> these ACs cannot be met as written and the concatenated-bundle fallback must be designed
-> instead. This is carried into Epic 5 as decision work, not assumed here.
+**Then** the mitm CA is present in the **system** trust store and satisfies `curl`
+**And** the standard CA env points at the shared public cert
+**And** a public HTTPS call from inside the guest — such as `git clone` from `github.com` — succeeds, proving public HTTPS still works
+**And** a model call through the agent is the concept proof (curl alone is the smoke test)
 
 ### Story 2.6: Proxy health gates the guest
 
@@ -606,9 +579,8 @@ So that my first request does not fail against a proxy that has not finished boo
 
 **Given** the proxy service
 **When** it is defined
-**Then** it carries a healthcheck that exercises the proxy, not merely a process-alive check
+**Then** it carries a healthcheck that exercises the proxy port
 **And** the opencode service waits on `depends_on: proxy: condition: service_healthy`
-**And** keys are loaded before the healthcheck reports healthy, so a first request cannot race key loading
 **And** a proxy that never becomes healthy surfaces a readable error rather than an indefinite hang
 
 ## Epic 3: Sealing Egress to an Approved List
@@ -682,7 +654,7 @@ So that a fresh install works out of the box and my agent's attack surface is on
 
 **Given** a fresh install
 **When** the CLI seeds `/etc/secureai/whitelist.yaml`
-**Then** it contains exactly `api.anthropic.com`, `github.com`, `*.githubusercontent.com`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `models.dev`, `opencode.ai`, and `astral.sh` (AD-15)
+**Then** it contains exactly `api.anthropic.com`, `github.com`, `*.githubusercontent.com`, `registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`, `models.dev`, `models.opencode.ai`, `opencode.ai`, and `astral.sh` (AD-15)
 **And** the file holds one host per line, and `*.example.com` matches subdomains
 **And** narrowing the baseline is an edit to this file rather than a code change
 **And** the seeded baseline matches the documented default allowlist, so documentation and behavior cannot disagree
@@ -706,15 +678,13 @@ So that I do not have to end and restart my work to unblock a legitimate depende
 
 As a developer,
 I want to see the current allowlist,
-So that I know exactly what my agent is permitted to reach.
+So that I know what my agent is permitted to reach.
 
 **Acceptance Criteria:**
 
 **Given** a configured allowlist
 **When** I run `secureai whitelist list`
 **Then** the current entries are printed
-**And** the listing reflects the synced config the proxy is actually reading
-**And** an empty or missing allowlist is reported clearly rather than printing nothing
 
 > **Honesty constraint carried into this epic (AR26):** `curl https://google.com` failing
 > proves **the proxy enforces**, because curl honors the proxy environment variables. It does
@@ -779,29 +749,9 @@ So that I can recover from an interrupted session without hunting for containers
 **And** both commands work whether or not a session was ever started, without erroring obscurely
 **And** neither command requires the user to know Docker
 
-### Story 4.4: Measure the time to a ready session, and record it
+### Story 4.4: Measure the time to a ready session — REMOVED (out of scope for concept demo)
 
-As a product owner,
-I want the real time to a ready session measured and written down,
-So that the PRD's 30s budget is answered with a number instead of an assumption.
-
-**Acceptance Criteria:**
-
-**Given** a built guest image and a healthy host
-**When** `secureai opencode` is timed from invocation to the point the agent is ready to accept input
-**Then** the elapsed time is measured and reported
-**And** the measurement is decomposed — proxy start to healthy, Kata VM boot, agent ready — so the dominant cost is visible rather than averaged into a single number
-**And** a cold run and a warm run are distinguished, because Kata VM boot is the term in question
-**And** the result is recorded **against the PRD's 30s budget**, stated as met or not met, never as "close enough" or "acceptable"
-**And** a **miss changes no code**: performance tuning is out of MVP scope (NFR14), so a miss is recorded as a PRD amendment to discuss, not a defect to optimize away inside this epic
-**And** the number is recorded even when the budget is met, so a later change has a baseline to be compared against
-**And** the measurement is reported as a **measurement**, not as a guarantee — it characterizes one host on one day, and is not a claim about every developer machine
-
-> **This story produces a number, not a fix.** That is deliberate. The PRD both budgets 30s and
-> accepts that Kata boot is slow; the spine marks the budget untested and names a failure as a PRD
-> conversation. Measuring it settles a question the PRD left open, in either direction, without
-> pulling performance work — explicitly deferred under NFR14 — into an MVP whose value is
-> demonstrating isolation.
+Produces a number, not a demo. Dropped permanently 2026-10-13.
 
 ## Epic 5: Proving the Security Claim
 
@@ -856,38 +806,13 @@ So that the enforcement claim rests on an observation rather than on reading the
 **And** the output **explicitly states the limit of this gate**: it does not prove the guest cannot reach that host by another path (AR26)
 **And** the output does not claim network-level enforcement, which is out of scope for this MVP
 
-### Story 5.4: Gate (d) — the runtime inside the guest can actually talk through the proxy
+### Story 5.4: Gate (d) — REMOVED (out of scope for concept demo)
 
-As a reviewer,
-I want proof that the agent's own runtime trusts the proxy,
-So that curl succeeding is never mistaken for the agent working.
+Bun-runtime cert proof. Dropped permanently 2026-10-13; a model call through the agent is the concept proof.
 
-**Acceptance Criteria:**
+### Story 5.5: Network backstop investigation — REMOVED (out of scope for concept demo)
 
-**Given** a live session
-**When** `secureai verify` makes an HTTPS call **from the Bun/Node runtime inside the guest**
-**Then** the call succeeds through the proxy
-**And** the check is **not** satisfied by curl, which proves only curl (AD-10)
-**And** if the runtime does not honour `NODE_EXTRA_CA_CERTS`, the gate is reported **failed** with the failure family named, and Story 2.5 is reopened rather than marked passing
-**And** a partial pass — curl working while the runtime does not — is reported as a **failure**, not a warning
-
-### Story 5.5: Resolve the blocking question about what the bridge actually guarantees
-
-As a product owner,
-I want to know whether the network itself backstops the proxy,
-So that the system's security claim describes what it truly provides.
-
-**Acceptance Criteria:**
-
-**Given** the compose network with `internal: true` on the bridge
-**When** I test whether it applies to the Kata VM's tap device
-**Then** the answer is recorded as a decision, either way (AR2)
-**And** if it applies, AD-1's accepted risk is **retired** — the guest has no route to the internet and the stack is stronger than the spine claims
-**And** if it does not apply, the setting is documented as **false comfort** and AD-1's accepted risk remains in force and is stated accurately
-**And** the spine's Open Questions section reflects the answer rather than leaving it open, including the `internal: TBD` placeholder left in the structural seed
-
-> **This is the BLOCKING question, and its answer changes the spine's security claim — not just
-> its wording.** AD-1's accepted risk is provisional *only* pending this answer.
+Enforcement is cooperative by design (AD-1). No `internal: true` claim is made. Dropped permanently 2026-10-13.
 
 ### Story 5.6: Prove the guest is actually in a VM with its own kernel
 
@@ -905,24 +830,6 @@ So that the VM-isolation claim is observed rather than inferred from a config fi
 **And** the check is performed against the **running container**, not against `docker-compose.yml` or `daemon.json`, because those are declarations rather than observations
 **And** a failure here invalidates the isolation premise of the entire system and is escalated rather than worked around
 
-### Story 5.7: Determine whether the guest can reach the internet around the proxy
+### Story 5.7: Bypass-path measurement — REMOVED (out of scope for concept demo)
 
-As a reviewer of this system's security,
-I want to know whether the guest can reach the internet by a path that never touches the proxy,
-So that the enforcement claim describes the real attack surface rather than the intended one.
-
-**Acceptance Criteria:**
-
-**Given** a live session
-**When** I attempt an outbound request from inside the guest **without** the proxy environment variables
-**Then** the result is recorded explicitly as blocked or reachable, whichever it is
-**And** the answer is recorded alongside the `internal: true` outcome from Story 5.5, because the two are distinct questions — a bridge setting and a direct-path bypass
-**And** if the guest is reachable around the proxy, AD-1's accepted risk is documented as **real and unmitigated**, with the specific bypass path named
-**And** the finding is recorded in the spine's Open Questions and Deferred sections rather than absorbed silently into this document
-**And** if the guest cannot route around the proxy, AD-1's accepted risk is retired alongside Story 5.5
-
-> **Scope note:** this story produces a **measurement and a documented finding**, not a fix. That
-> is deliberate — the PRD places a network-level egress backstop out of scope, and the spine
-> defers it until the threat model changes from a trusted developer to an adversarial agent.
-> Adding one here would exceed the agreed quality bar. The story exists so the *absence* of a
-> backstop is a known, stated fact rather than an unexamined assumption.
+Produces a finding, not a demo. Dropped permanently 2026-10-13.

@@ -32,6 +32,7 @@ readonly -a SECUREAI_BASELINE_ALLOWLIST=(
   "pypi.org"
   "files.pythonhosted.org"
   "models.dev"
+  "models.opencode.ai"
   "opencode.ai"
   "astral.sh"
 )
@@ -189,7 +190,7 @@ cmd_init_config() {
     } >"${SECUREAI_ETC}/whitelist.yaml"
     chmod 0640 "${SECUREAI_ETC}/whitelist.yaml"
     chown root:root "${SECUREAI_ETC}/whitelist.yaml"
-    ok "seeded the 9-host allowlist baseline"
+    ok "seeded the 10-host allowlist baseline"
   fi
 
   [[ -f "${SECUREAI_ETC}/settings.yaml" ]] || {
@@ -933,6 +934,21 @@ cmd_opencode() {
   need_docker
   cmd_init_config >/dev/null
   load_compose_env
+  # The launch directory is the only host content the guest sees, mounted as
+  # /workspace. Refuse $HOME and / so SSH keys and credentials are never
+  # exposed to the sandbox.
+  {
+    local _cwd _home
+    _cwd="$(pwd -P)"
+    _home="$(cd ~ && pwd -P)"
+    if [[ "$_cwd" == "$_home" || "$_cwd" == "/" ]]; then
+      die "Refusing to launch from ${_cwd}.
+  This would expose SSH keys and credentials to the sandbox.
+  Run from a project subdirectory."
+    fi
+    SECUREAI_WORKSPACE="$_cwd"
+    export SECUREAI_WORKSPACE
+  }
   assert_proxy_runtime_pinned
   assert_runtime_registered kata
   assert_runtime_registered runc

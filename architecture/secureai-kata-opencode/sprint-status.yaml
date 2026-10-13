@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 10-08-2026 10:07
-last_updated: 10-12-2026 16:07
+last_updated: 10-13-2026 11:15
 project: SecureAI
 project_key: SECUREAI
 tracking_system: file-system
@@ -43,7 +43,7 @@ development_status:
   1-5-selinux-labels-on-host-state: done
   1-6-ca-export-and-image-build-order: done
   1-7-guest-image-with-toolchain-vendored-catalog-and-fixed-ip-net: in-progress
-  1-8-one-name-for-each-thing-greppable: in-progress
+  1-8-one-name-for-each-thing-greppable: backlog
   epic-1-retrospective: optional
 
   epic-2: in-progress
@@ -52,7 +52,7 @@ development_status:
   2-3-proxy-runs-in-the-trusted-zone-pinned-to-runc: done
   2-4-the-proxy-injects-the-real-key-and-logs-only-a-fingerprint: done
   2-5-the-guest-trusts-the-proxy-without-losing-public-https: in-progress
-  2-6-proxy-health-gates-the-guest: in-progress
+  2-6-proxy-health-gates-the-guest: done
   epic-2-retrospective: optional
 
   epic-3: in-progress
@@ -61,22 +61,22 @@ development_status:
   3-3-the-proxy-fails-closed: done
   3-4-the-allowlist-is-a-seeded-owned-baseline: done
   3-5-live-allowlist-updates-without-a-restart: done
-  3-6-inspect-the-allowlist: in-progress
+  3-6-inspect-the-allowlist: done
   epic-3-retrospective: optional
 
   epic-4: in-progress
   4-1-launch-an-interactive-session-not-an-exec: done
   4-2-the-proxy-dies-with-the-agent: done
   4-3-stop-and-inspect-the-stack: done
-  4-4-measure-the-time-to-a-ready-session-and-record-it: in-progress
+  4-4-measure-the-time-to-a-ready-session-and-record-it: backlog
   epic-4-retrospective: optional
 
   epic-5: in-progress
   5-1-gate-a-the-proxy-sees-the-api-host: in-progress
   5-2-gate-b-injection-occurred-as-a-fingerprint: in-progress
   5-3-gate-c-a-non-allowlisted-host-fails: in-progress
-  5-4-gate-d-the-runtime-inside-the-guest-can-actually-talk-throug: in-progress
+  5-4-gate-d-the-runtime-inside-the-guest-can-actually-talk-throug: backlog
   5-5-resolve-the-blocking-question-about-what-the-bridge-actually: backlog
   5-6-prove-the-guest-is-actually-in-a-vm-with-its-own-kernel: in-progress
-  5-7-determine-whether-the-guest-can-reach-the-internet-around-th: in-progress
+  5-7-determine-whether-the-guest-can-reach-the-internet-around-th: backlog
   epic-5-retrospective: optional

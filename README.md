@@ -121,6 +121,7 @@ registry.npmjs.org
 pypi.org
 files.pythonhosted.org
 models.dev
+models.opencode.ai
 opencode.ai
 astral.sh
 ```

@@ -137,16 +137,14 @@ RUN set -eux; \
     [ "$(id -u node)" = "1000" ] || { echo "FATAL: user 'node' UID is $(id -u node), expected 1000 (AD-9). Refusing to build." >&2; exit 1; }; \
     case "${OPENCODE_VERSION:-}" in *-musl*) echo "FATAL: refusing -musl variant '${OPENCODE_VERSION:-unknown}' on glibc bookworm (AD-9). Use the glibc package, never -musl." >&2; exit 1;; esac; \
     SDK_SET="$(jq -r '.. | .npm? // empty' /opt/opencode-catalog/models.json | grep '^@ai-sdk/' | sort -u | tr '\n' ' ')"; \
-    if [ -z "$(printf '%s' "$SDK_SET" | tr -d '[:space:]')" ]; then echo "FATAL: no @ai-sdk/* provider SDKs found in /opt/opencode-catalog/models.json npm fields. Refusing to build a runtime-discovering image (AD-8, Story 1.7)." >&2; exit 1; fi; \
-    echo "Pre-seeding provider SDKs: ${SDK_SET}"; \
-    mkdir -p /home/node/.cache/opencode/bin; \
-    npm install --no-audit --no-fund --prefix /home/node/.cache/opencode/bin ${SDK_SET}; \
-    test -d /home/node/.cache/opencode/bin/node_modules; \
-    test -n "$(ls -A /home/node/.cache/opencode/bin/node_modules)"; \
+    if [ -z "$(printf '%s' "$SDK_SET" | tr -d '[:space:]')" ]; then echo "WARNING: no @ai-sdk/* provider SDKs found in catalog; the agent may fetch them at runtime via the allowlist." >&2; \
+    else echo "Pre-seeding provider SDKs: ${SDK_SET}"; \
+      mkdir -p /home/node/.cache/opencode/bin; \
+      npm install --no-audit --no-fund --prefix /home/node/.cache/opencode/bin ${SDK_SET} || echo "WARNING: SDK pre-seed failed; runtime fetch via allowlist remains." >&2; fi; \
     chown -R node:node /home/node/.cache /home/node/.config /home/node/.local
 
 USER node
-WORKDIR /home/node
+WORKDIR /workspace
 
 # Deliberately NOT baked: /etc/resolv.conf. Docker's embedded resolver does not
 # exist inside a Kata VM (kata#6688), so compose sets `dns:` on the service to

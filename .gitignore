@@ -7,3 +7,6 @@
 # make a repo-wide grep report a string that no longer exists in any source.
 __pycache__/
 *.py[cod]
+
+# Local VM images. Large per-machine artifacts, never source.
+*.qcow2
