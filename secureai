@@ -766,7 +766,7 @@ assert_kata_vmm_path() {
   container_var_run_t, so the shim is refused its PID file and the guest would
   wedge in Created. Observed: ${label_line}. SELinux mode: ${sel_mode}.
   Repair with:
-    sudo semanage fcontext -m -t container_var_run_t \"/var/run/vc(/.*)?\"
+    sudo semanage fcontext -m -t container_var_run_t \"/run/vc(/.*)?\"
     sudo restorecon -RF ${pid_dir}
     ls -ldZ ${pid_dir}
   If denials persist after the relabel, rebuild the VMM policy from live
@@ -1075,6 +1075,30 @@ teardown_session() {
   SESSION_ACTIVE=0
 }
 
+# The guest runs as node (uid 1000), but named volumes are created root-owned
+# on first use: without this the agent's first mkdir dies with EACCES and the
+# session ends before the TUI ever draws. One chown per volume, durable until
+# the volume itself is removed.
+ensure_guest_volume_ownership() {
+  local vol
+  # Names are `secureai_` + the short names in docker-compose.yml; compose()
+  # below always runs with --project-name secureai, so these cannot drift
+  # unless both change together.
+  for vol in secureai_opencode-config secureai_opencode-data; do
+    timeout 20 docker volume inspect "$vol" >/dev/null 2>&1 \
+      || timeout 30 docker volume create "$vol" >/dev/null 2>&1 || die \
+"Could not create Docker volume ${vol} for the guest's persisted state.
+ Create it by hand, then re-run:  docker volume create ${vol}"
+    timeout 120 docker run --rm -v "${vol}:/v" docker.io/library/alpine \
+      chown -R 1000:1000 /v >/dev/null 2>&1 || die \
+"Could not set ownership on Docker volume ${vol}.
+ The guest runs as uid 1000 and a root-owned volume makes the agent fail
+ with EACCES on its first write. Fix by hand, then re-run:
+   docker run --rm -v ${vol}:/v docker.io/library/alpine chown -R 1000:1000 /v"
+  done
+  ok "guest volumes are node-owned"
+}
+
 cmd_opencode() {
   # Story 4.4: cold vs warm is an explicit label, not an inference. Cold is a
   # first run after build or reboot (VM boot + caches cold); warm is a second
@@ -1137,6 +1161,8 @@ cmd_opencode() {
     warn "No CA at ${SECUREAI_CA}. The guest image must have it baked in;
      if you have not built since exporting a CA, interception will fail closed."
   fi
+
+  ensure_guest_volume_ownership
 
   # A session killed mid-flight (power loss, SIGKILL) leaves containers holding
   # these two names, and the next session then dies on a name conflict instead

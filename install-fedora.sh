@@ -39,10 +39,46 @@ readonly SECUREAI_ETC="/etc/secureai"
 readonly SECUREAI_VAR="/var/lib/secureai"
 readonly SECUREAI_DAEMON_JSON="/etc/docker/daemon.json"
 
+# Kata backend flavour. `static` (default) installs the pinned upstream
+# static bundle (Rust runtime-rs with a self-consistent guest) because the
+# Fedora RPM Go runtime does not boot on real hosts: QEMU dies on its PID
+# file and every guest wedges in Created. `rpm` keeps the old Fedora-package
+# path (guest assets built by kata-osbuilder-generate.service).
+readonly SECUREAI_KATA_FLAVOR="${SECUREAI_KATA_FLAVOR:-static}"
+# Pinned upstream release for the static flavour. Override the URL for an
+# air-gapped mirror; it must stay an amd64 kata-static tarball.
+readonly SECUREAI_KATA_STATIC_VERSION="${SECUREAI_KATA_STATIC_VERSION:-4.2.0}"
+readonly SECUREAI_KATA_STATIC_URL="${SECUREAI_KATA_STATIC_URL:-https://github.com/kata-containers/kata-containers/releases/download/${SECUREAI_KATA_STATIC_VERSION}/kata-static-${SECUREAI_KATA_STATIC_VERSION}-amd64.tar.zst}"
+readonly SECUREAI_KATA_STATIC_ROOT="/opt/kata"
+readonly SECUREAI_KATA_STATIC_SHIM="/opt/kata/runtime-rs/bin/containerd-shim-kata-v2"
+readonly SECUREAI_KATA_STATIC_CONFIG_SRC="/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml"
+readonly SECUREAI_KATA_STATIC_CONFIG="/etc/kata-containers/configuration.toml"
+# Minimal QEMU subset extracted from the multi-GB bundle (it ships every
+# hypervisor and guest variant; only these paths serve a Docker QEMU session).
+# The guest kernel/image entries are symlinks to versioned targets; the
+# installer resolves and extracts those targets dynamically so a version bump
+# needs no member-list change.
+readonly -a SECUREAI_KATA_STATIC_MEMBERS=(
+  ./opt/kata/VERSION
+  ./opt/kata/runtime-rs/bin/containerd-shim-kata-v2
+  ./opt/kata/bin/qemu-system-x86_64
+  ./opt/kata/libexec/virtiofsd
+  ./opt/kata/share/kata-qemu
+  ./opt/kata/share/kata-containers/vmlinux.container
+  ./opt/kata/share/kata-containers/kata-containers.img
+  ./opt/kata/share/defaults/kata-containers/runtime-rs/configuration-qemu-runtime-rs.toml
+)
+
 # Payload: directory of an already-materialised tree, or a base URL to fetch
 # each file from. Empty means "look next to this script", then give up.
 SECUREAI_PAYLOAD_DIR="${SECUREAI_PAYLOAD_DIR:-}"
 SECUREAI_REPO_BASE="${SECUREAI_REPO_BASE:-}"
+
+# Optional pins for the Kata wiring. The static flavour fills both;
+# SECUREAI_KATA_FLAVOR=rpm re-discovers them from the package database.
+# Exported overrides are honoured as-is (used to test against fixtures).
+SECUREAI_KATA_CONFIG_PATH="${SECUREAI_KATA_CONFIG_PATH:-}"
+SECUREAI_KATA_SHIM="${SECUREAI_KATA_SHIM:-}"
 
 # Must stay in step with the guest Dockerfile's COPY paths and with the
 # compose build contexts -- a file missing here is a file missing from
@@ -155,9 +191,23 @@ install_packages() {
   else
     missing+=("docker")
   fi
-  # Kata, SELinux tooling, dbus: presence means the rpm is installed.
-  local pkg
-  for pkg in kata-containers policycoreutils policycoreutils-python-utils dbus dbus-daemon; do
+  # kata-containers' %post builds the guest initrd with dracut's dbus module,
+  # but in a single transaction dbus-daemon lands AFTER kata, so the %post
+  # fails and the whole transaction is reported failed. Install the dbus pair
+  # first when missing so the later transaction (if any) cannot hit this.
+  if ! rpm -q dbus-daemon >/dev/null 2>&1 || ! rpm -q dbus >/dev/null 2>&1; then
+    dnf -y install dbus dbus-daemon \
+      || die "Could not install dbus/dbus-daemon, which the kata-containers
+       %post script needs present for its dracut build."
+  fi
+  # Kata, SELinux tooling: presence means the rpm is installed. The Kata
+  # package itself is only required for the `rpm` flavour; the default
+  # `static` flavour ships its own runtime under /opt/kata instead.
+  local pkg kata_pkgs=()
+  if [[ "$SECUREAI_KATA_FLAVOR" == "rpm" ]]; then
+    kata_pkgs=(kata-containers)
+  fi
+  for pkg in "${kata_pkgs[@]}" policycoreutils policycoreutils-python-utils dbus dbus-daemon; do
     if rpm -q "$pkg" >/dev/null 2>&1; then
       ok "${pkg} already present"
     else
@@ -170,9 +220,9 @@ install_packages() {
        If 'docker' is among them on a host that already runs Docker CE, the
        bare name resolves to Fedora's moby-engine, which conflicts with
        docker-ce-cli -- provide the engine from your existing repo instead.
-       If the failure is in the kata-containers post-install script, the
-       missing tool is almost certainly dracut's dbus module, provided by
-       the dbus/dbus-daemon prerequisites on the same install line."
+       The dbus pair is installed ahead of this transaction because the
+       kata-containers %post script (rpm flavour) needs it for its dracut
+       build; a %post failure there otherwise fails the whole transaction."
   else
     ok "required packages already present"
   fi
@@ -206,6 +256,124 @@ install_packages() {
      The kata runtime cannot be registered until Docker is running:
        sudo systemctl enable --now docker"
   ok "docker enabled and running"
+}
+
+# =========================================================================
+# Kata static backend (the default flavour).
+#
+# Installs the pinned upstream kata-static bundle: the Rust runtime-rs shim
+# plus a self-consistent guest (kernel/image built together upstream). Only
+# a minimal QEMU subset is extracted -- the tarball ships every hypervisor
+# and guest variant and would otherwise eat gigabytes.
+# =========================================================================
+install_static_kata() {
+  log "Installing upstream static Kata ${SECUREAI_KATA_STATIC_VERSION} (Rust runtime-rs)"
+
+  [[ "$(uname -m)" == "x86_64" ]] || die \
+"Kata static flavour needs x86_64 (this host is $(uname -m)).
+ The upstream bundle ships no other architecture; use the RPM flavour instead:
+   SECUREAI_KATA_FLAVOR=rpm sudo bash install-fedora.sh"
+
+  # Idempotent: a present shim at the pinned version means a previous run
+  # finished; skip the ~1 GB download.
+  if [[ -x "$SECUREAI_KATA_STATIC_SHIM" ]]; then
+    local installed_version
+    installed_version="$("$SECUREAI_KATA_STATIC_SHIM" --version 2>/dev/null || true)"
+    if grep -qF "$SECUREAI_KATA_STATIC_VERSION" <<<"$installed_version"; then
+      ok "static Kata ${SECUREAI_KATA_STATIC_VERSION} already present"
+      SECUREAI_KATA_CONFIG_PATH="$SECUREAI_KATA_STATIC_CONFIG"
+      SECUREAI_KATA_SHIM="$SECUREAI_KATA_STATIC_SHIM"
+      export SECUREAI_KATA_CONFIG_PATH SECUREAI_KATA_SHIM
+      return 0
+    fi
+    warn "a different static Kata is present; replacing it with ${SECUREAI_KATA_STATIC_VERSION}."
+  fi
+
+  # Stage the tarball where ~1 GB fits (/var/tmp preferred; /tmp is often
+  # tmpfs). It is deleted right after extraction so the later `secureai
+  # build` (gigabytes of images) is not starved.
+  local stage_dir="" free_kb candidate
+  for candidate in /var/tmp /tmp; do
+    free_kb="$(df -k --output=avail "$candidate" 2>/dev/null | tail -1 || echo 0)"
+    if (( free_kb > 1100000 )); then stage_dir="$candidate"; break; fi
+  done
+  [[ -n "$stage_dir" ]] || die \
+"No staging area with ~1 GB free for the Kata bundle (checked /var/tmp, /tmp).
+ Free space, then re-run. The bundle is deleted right after extraction."
+  stage_dir="$(mktemp -d -p "$stage_dir" secureai-kata.XXXXXX)"
+  trap "rm -rf '$stage_dir'" RETURN
+
+  local tarball="${stage_dir}/kata-static.tar"
+  log "Downloading ${SECUREAI_KATA_STATIC_URL}"
+  printf '    (about 1 GB; deleted after extraction)\n'
+  curl -fsSL --retry 3 -o "$tarball" "$SECUREAI_KATA_STATIC_URL" \
+    || die "Could not download the Kata static bundle from:
+      ${SECUREAI_KATA_STATIC_URL}
+    If that URL came from a GitHub API query, echo it first -- an empty
+    result turns into this exact failure.
+    Override with:  SECUREAI_KATA_STATIC_URL=<mirror-url> sudo bash install-fedora.sh"
+
+  # The download must actually be a tarball: an HTML error page saved as
+  # .tar fails here with names, not halfway through extraction.
+  local listed
+  listed="$(tar -tf "$tarball" 2>/dev/null || true)"
+  [[ -n "$listed" ]] || die "The downloaded file is not a tar archive:
+      ${SECUREAI_KATA_STATIC_URL}
+    It is probably an error page. Check the URL and re-run."
+  local member
+  for member in "${SECUREAI_KATA_STATIC_MEMBERS[@]}"; do
+    grep -qxE "${member}(/.*)?" <<<"$listed" \
+      || die "The Kata bundle has no member ${member}.
+      The bundle layout changed; update SECUREAI_KATA_STATIC_MEMBERS."
+  done
+
+  tar -xf "$tarball" -C / "${SECUREAI_KATA_STATIC_MEMBERS[@]}" \
+    || die "Extracting the Kata bundle failed. Check space and re-run."
+
+  # The guest kernel/image members are symlinks to versioned targets: resolve
+  # and extract whatever they point at, so release bumps need no code change.
+  local link target target_member
+  for link in /opt/kata/share/kata-containers/vmlinux.container \
+              /opt/kata/share/kata-containers/kata-containers.img; do
+    [[ -L "$link" ]] || die "Expected symlink missing after extract: ${link}"
+    target="$(readlink -f "$link")"
+    [[ -n "$target" && "$target" == /opt/kata/* ]] \
+      || die "${link} points outside the bundle (${target:-unresolvable}). Refusing."
+    target_member="./${target#/}"
+    grep -qxF "$target_member" <<<"$listed" \
+      || die "Symlink target missing from the bundle: ${target_member}"
+    tar -xf "$tarball" -C / "$target_member" \
+      || die "Extracting ${target_member} failed."
+  done
+
+  # The runtime-rs QEMU config is the shim's input. Seed it once; never
+  # clobber an operator's edits on re-run.
+  install -d -m 0755 /etc/kata-containers
+  if [[ ! -s "$SECUREAI_KATA_STATIC_CONFIG" ]]; then
+    install -m 0644 "$SECUREAI_KATA_STATIC_CONFIG_SRC" "$SECUREAI_KATA_STATIC_CONFIG"
+  fi
+
+  # Convenience symlink onto PATH (nerdctl-style lookup); Docker itself uses
+  # the absolute pin below and never searches PATH.
+  ln -sf "$SECUREAI_KATA_STATIC_SHIM" /usr/local/bin/containerd-shim-kata-v2
+
+  # Assert what landed rather than trusting the extract.
+  [[ -x "$SECUREAI_KATA_STATIC_SHIM" ]] \
+    || die "Static shim missing after extract: ${SECUREAI_KATA_STATIC_SHIM}"
+  "$SECUREAI_KATA_STATIC_SHIM" --version 2>/dev/null \
+    | grep -qF "$SECUREAI_KATA_STATIC_VERSION" \
+    || warn "static shim does not report ${SECUREAI_KATA_STATIC_VERSION}; continuing anyway."
+  [[ -f "$(readlink -f /opt/kata/share/kata-containers/vmlinux.container)" \
+    && -f "$(readlink -f /opt/kata/share/kata-containers/kata-containers.img)" ]] \
+    || die "Static guest kernel/image missing after extract. Check /opt/kata."
+
+  rm -rf "$stage_dir"
+  trap - RETURN
+
+  SECUREAI_KATA_CONFIG_PATH="$SECUREAI_KATA_STATIC_CONFIG"
+  SECUREAI_KATA_SHIM="$SECUREAI_KATA_STATIC_SHIM"
+  export SECUREAI_KATA_CONFIG_PATH SECUREAI_KATA_SHIM
+  ok "static Kata ${SECUREAI_KATA_STATIC_VERSION} ready"
 }
 
 # =========================================================================
@@ -294,6 +462,15 @@ ensure_kata_guest_assets() {
     return 0
   fi
 
+  # Static flavour ships its own guest: a miss here means a bad extract, not
+  # something the Fedora osbuilder unit could ever fix.
+  if [[ "${SECUREAI_KATA_FLAVOR:-static}" == "static" ]]; then
+    die "Kata's static guest kernel/initrd are missing:
+    ${missing//$'\n'/ }
+  The upstream bundle was not extracted correctly. Re-run install-fedora.sh
+  (it re-extracts when the shim is absent) or check /opt/kata by hand."
+  fi
+
   log "Kata's guest kernel/initrd are missing -- building them now"
   printf '    missing: %s\n' "${missing//$'\n'/ }"
 
@@ -351,14 +528,18 @@ write_daemon_json() {
 
   local raw_version version_key time_ns_flag
   raw_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "")"
-  local kata_config_path=""
-  # Ask the package database first: on F38/F43/F44 the toml lands at a
-  # different path depending on which kata-containers package variant shipped it
-  # (qemu Go runtime vs runtime-rs vs rust-shim defaults), and a stale
-  # hard-coded path is exactly the kind of assumption this installer exists to
-  # refuse. Fall back to known paths only if the rpm query yields nothing.
-  kata_config_path="$(rpm -ql kata-containers 2>/dev/null \
-      | grep -E 'configuration.*\.toml$' | head -1 || true)"
+  # A static install (or an explicit SECUREAI_KATA_CONFIG_PATH) names the
+  # config outright. Otherwise ask the package database first: on F38/F43/F44
+  # the toml lands at a different path depending on which kata-containers
+  # package variant shipped it (qemu Go runtime vs runtime-rs vs rust-shim
+  # defaults), and a stale hard-coded path is exactly the kind of assumption
+  # this installer exists to refuse. Fall back to known paths only if the rpm
+  # query yields nothing.
+  local kata_config_path="${SECUREAI_KATA_CONFIG_PATH:-}"
+  if [[ -z "$kata_config_path" ]]; then
+    kata_config_path="$(rpm -ql kata-containers 2>/dev/null \
+        | grep -E 'configuration.*\.toml$' | head -1 || true)"
+  fi
   if [[ -z "$kata_config_path" ]]; then
     for candidate in \
         /usr/share/kata-containers/configuration.toml \
@@ -383,30 +564,34 @@ write_daemon_json() {
        SECUREAI_KATA_CONFIG_PATH=/your/discovery sudo bash install-fedora.sh"
   fi
   SECUREAI_KATA_CONFIG_PATH="${SECUREAI_KATA_CONFIG_PATH:-${kata_config_path}}"
-  # The shim binary Docker must exec, resolved from the package database
+  # The shim binary Docker must exec: the static flavour's Rust shim via
+  # SECUREAI_KATA_SHIM, else resolved from the package database (rpm flavour)
   # rather than the runtime class. Class-form (`runtimeType` as
   # `io.containerd.kata.v2`) resolves the binary Docker-side by convention
   # and demonstrably lands on `kata-runtime` -- which lost its OCI verbs
   # (`create`, `features`) when Kata dropped the CLI in 2.x, so every guest
   # dies before booting. It is ALSO PATH-dependent: a same-named shim
-  # earlier on PATH (observed: a /usr/local/bin runtime-rs install) hijacks
-  # the boot with 'Runtime name is missing in the configuration'. An
+  # earlier on PATH takes the boot and can fail on a mismatched config. An
   # absolute path in `runtimeType` is Docker-valid ("a full path to the
-  # binary"), deterministic, and hijack-proof. (`path` + `runtimeType`
-  # together are rejected by dockerd, so the pin lives in `runtimeType`.)
+  # binary"), deterministic, and hijack-proof -- no PATH search happens at
+  # all, so the /usr/local/bin convenience symlink is inert. (`path` +
+  # `runtimeType` together are rejected by dockerd, so the pin lives in
+  # `runtimeType`.)
   # No per-release paths: the rpm query works wherever the Fedora package
   # ships the Go shim.
-  local kata_shim_path=""
-  kata_shim_path="$(rpm -ql kata-containers 2>/dev/null \
-      | grep -E 'containerd-shim-kata-v2$' | head -1 || true)"
+  local kata_shim_path="${SECUREAI_KATA_SHIM:-}"
+  if [[ -z "$kata_shim_path" ]]; then
+    kata_shim_path="$(rpm -ql kata-containers 2>/dev/null \
+        | grep -E 'containerd-shim-kata-v2$' | head -1 || true)"
+  fi
   if [[ -z "$kata_shim_path" ]]; then
     kata_shim_path="/usr/bin/containerd-shim-kata-v2"
   fi
   if [[ ! -x "$kata_shim_path" ]]; then
-    die "Kata's Go shim is missing or not executable at ${kata_shim_path}.
-     Docker must exec exactly this binary: a same-named shim earlier on PATH
-     (e.g. a /usr/local/bin runtime-rs install) fails on the Fedora config.
-     After kata-containers is installed, locate it with:
+    die "Kata's shim is missing or not executable at ${kata_shim_path}.
+     Docker must exec exactly this binary. Static flavour: re-run
+     install-fedora.sh (it re-extracts when the shim is absent). RPM flavour:
+     after kata-containers is installed, locate it with:
        rpm -ql kata-containers | grep containerd-shim-kata-v2"
   fi
   if version_key="$(docker_version_key "$raw_version")"; then
@@ -770,11 +955,11 @@ ensure_kata_vmm_policy() {
   fi
 
   # Idempotent like label_paths: -a then -m, never a delete-first dance.
-  # /run is an equivalency alias of /var/run in the SELinux file contexts, so
-  # the spec must name /var/run/vc -- using /run/vc is refused as conflicting
-  # with the equivalency rule. Both names address the same tmpfs files.
-  semanage fcontext -a -t container_var_run_t "/var/run/vc(/.*)?" 2>/dev/null \
-    || semanage fcontext -m -t container_var_run_t "/var/run/vc(/.*)?" \
+  # /run and /var/run are an equivalency pair; semanage requires the /run
+  # form here (the /var/run form is refused as conflicting with the
+  # equivalency rule). Both names address the same tmpfs files.
+  semanage fcontext -a -t container_var_run_t "/run/vc(/.*)?" 2>/dev/null \
+    || semanage fcontext -m -t container_var_run_t "/run/vc(/.*)?" \
     || die "Could not set the SELinux fcontext for /run/vc.
      The path currently has no usable label; QEMU would be refused its PID file."
   restorecon -RF /run/vc/vm 2>/dev/null \
@@ -915,7 +1100,7 @@ TEEOF
     die "/run/vc/vm carries '${vm_type:-unknown}', expected container_var_run_t:
      ${vm_label}
   Repair with:
-    sudo semanage fcontext -m -t container_var_run_t \"/var/run/vc(/.*)?\"
+    sudo semanage fcontext -m -t container_var_run_t \"/run/vc(/.*)?\"
     sudo restorecon -RF /run/vc/vm
     ls -ldZ /run/vc/vm"
   fi
@@ -937,7 +1122,57 @@ TEEOF
   fi
   ok "/run/vc/vm is ${vm_type}, mode ${vm_mode}: ${vm_label}"
 
+  # /run is tmpfs: without this the PID dir is gone after every reboot and
+  # the CLI refuses to start. tmpfiles recreates it (with the fcontext type)
+  # on every boot.
+  printf 'd /run/vc/vm 0755 root root -\n' > /etc/tmpfiles.d/secureai-kata.conf
+  systemd-tmpfiles --create /etc/tmpfiles.d/secureai-kata.conf 2>/dev/null \
+    || warn "systemd-tmpfiles could not create /run/vc/vm; create it by hand after reboot."
+
   rm -rf "$tmpdir"
+}
+
+# =========================================================================
+# VMM subjects as permissive domains.
+#
+# The Kata VMM subjects (shim, QEMU, virtiofsd) are denied pid/socket writes
+# under the kata state dirs while Enforcing. The textbook fix is an
+# audit2allow module built from live denials -- but hosts without a working
+# audit trail (ausearch permanently empty because auditd never writes) can
+# never produce that input; there the textbook fix is unprovable and the
+# session stays broken. Permissive DOMAINS keep the whole system Enforcing
+# while letting exactly container_runtime_t and container_t run -- far
+# narrower than setenforce 0, and sufficient (proven: guest boots, TUI
+# opens). If ausearch works on the host, prefer a scoped module built from
+# live denials and drop these.
+# =========================================================================
+ensure_kata_permissive_domains() {
+  log "Allowing the Kata VMM domains to run under Enforcing"
+
+  if ! command -v getenforce >/dev/null 2>&1; then
+    warn "SELinux tooling is absent; skipping permissive domains."
+    return 0
+  fi
+
+  local mode
+  mode="$(getenforce 2>/dev/null || echo Disabled)"
+  if [[ "$mode" != "Enforcing" ]]; then
+    warn "SELinux is ${mode}, not Enforcing. Permissive domains are unnecessary."
+    return 0
+  fi
+
+  local dom
+  for dom in container_runtime_t container_t; do
+    if semanage permissive -l 2>/dev/null | grep -qx "$dom"; then
+      ok "${dom} already permissive"
+    else
+      semanage permissive -a "$dom" \
+        || die "Could not set ${dom} permissive. The Kata VMM is denied its
+       pid/socket writes under Enforcing without this (or a scoped audit2allow
+       module, which needs a working audit trail this host may not have)."
+      ok "${dom} set permissive"
+    fi
+  done
 }
 
 # =========================================================================
@@ -960,11 +1195,15 @@ verify_install() {
 main() {
   check_preconditions
   install_packages
+  if [[ "$SECUREAI_KATA_FLAVOR" == "static" ]]; then
+    install_static_kata
+  fi
   write_daemon_json
   ensure_kata_guest_assets "${SECUREAI_KATA_CONFIG_PATH:-}"
   install_layout
   label_paths
   ensure_kata_vmm_policy
+  ensure_kata_permissive_domains
   verify_install
 
   printf '\n\033[1;32mSecureAI installed.\033[0m\n\n'
