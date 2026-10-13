@@ -86,6 +86,20 @@ ensure_compose_env() {
      ${template}. Re-run install-fedora.sh."
     fi
   fi
+  # Migrate a stale proxy GID from pre-2026-10-08 installs (10001). The proxy
+  # image runs as the base image's canonical 1000:1000 and is never remapped,
+  # so a compose.env pinning any other gid leaves the 0640 CA private key
+  # unreadable and mitmdump exits at startup on PermissionError. Seeding above
+  # preserves operator edits, so this migration must also preserve everything
+  # except the one stale value.
+  if grep -Eq '^[[:space:]]*SECUREAI_PROXY_GID=' "$SECUREAI_COMPOSE_ENV" 2>/dev/null; then
+    if ! grep -Eq '^[[:space:]]*SECUREAI_PROXY_GID=1000([[:space:]]|$|#)' \
+        "$SECUREAI_COMPOSE_ENV" 2>/dev/null; then
+      sed -i -E 's/^[[:space:]]*SECUREAI_PROXY_GID=.*/SECUREAI_PROXY_GID=1000/' \
+        "$SECUREAI_COMPOSE_ENV"
+      ok "migrated SECUREAI_PROXY_GID to 1000 in ${SECUREAI_COMPOSE_ENV}"
+    fi
+  fi
   chmod 0640 "$SECUREAI_COMPOSE_ENV" 2>/dev/null || true
   chown root:root "$SECUREAI_COMPOSE_ENV" 2>/dev/null || true
 }
@@ -221,6 +235,31 @@ cmd_init_config() {
       sync_to_runtime "$name"
     fi
   done
+  # Repair CA ownership from pre-1000 installs on every run, not only on
+  # `ca export`: the private key is 0640, so a stale group (e.g. 10001) makes
+  # mitmdump exit at startup on PermissionError for /config/ca/mitmproxy-ca.pem
+  # while policy files (synced above with the current gid) still load. The CA
+  # files are never regenerated here, only re-pinned, so baked-in guest trust
+  # stays valid.
+  if [[ -d "${SECUREAI_VAR}/ca" ]]; then
+    chown root:"$SECUREAI_PROXY_GID" "${SECUREAI_VAR}/ca" 2>/dev/null || true
+    chmod 2770 "${SECUREAI_VAR}/ca" 2>/dev/null || true
+    local caf
+    for caf in "${SECUREAI_VAR}/ca"/mitmproxy-ca.pem \
+               "${SECUREAI_VAR}/ca"/mitmproxy-ca.p12; do
+      [[ -f "$caf" ]] || continue
+      chown root:"$SECUREAI_PROXY_GID" "$caf" 2>/dev/null || true
+      chmod 0640 "$caf" 2>/dev/null || true
+    done
+    for caf in "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert.pem \
+               "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert.p12 \
+               "${SECUREAI_VAR}/ca"/mitmproxy-ca-cert.cer \
+               "${SECUREAI_VAR}/ca"/mitmproxy-dhparam.pem; do
+      [[ -f "$caf" ]] || continue
+      chown root:"$SECUREAI_PROXY_GID" "$caf" 2>/dev/null || true
+      chmod 0644 "$caf" 2>/dev/null || true
+    done
+  fi
   ok "configuration ready and mirrored to ${SECUREAI_VAR}"
 }
 

@@ -617,6 +617,18 @@ install_layout() {
     : >"${SECUREAI_ETC}/compose.env"
     chown root:root "${SECUREAI_ETC}/compose.env"
     chmod 0640 "${SECUREAI_ETC}/compose.env"
+  else
+    # Migrate a stale proxy GID from pre-2026-10-08 installs (10001). The proxy
+    # image runs as the base image's canonical 1000:1000, so any other gid
+    # leaves the 0640 CA private key unreadable and the proxy exits at startup.
+    # Only the one stale value is rewritten; every other operator edit survives.
+    if grep -Eq '^[[:space:]]*SECUREAI_PROXY_GID=' "${SECUREAI_ETC}/compose.env" 2>/dev/null \
+       && ! grep -Eq '^[[:space:]]*SECUREAI_PROXY_GID=1000([[:space:]]|$|#)' \
+         "${SECUREAI_ETC}/compose.env" 2>/dev/null; then
+      sed -i -E 's/^[[:space:]]*SECUREAI_PROXY_GID=.*/SECUREAI_PROXY_GID=1000/' \
+        "${SECUREAI_ETC}/compose.env"
+      ok "migrated SECUREAI_PROXY_GID to 1000 in ${SECUREAI_ETC}/compose.env"
+    fi
   fi
 
   # Seed config files into /etc/secureai without clobbering operator edits.
