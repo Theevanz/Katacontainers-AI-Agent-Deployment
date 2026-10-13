@@ -4,8 +4,8 @@
 > user ("should not be 'oh i will implement next time'"). Applied instead as
 > PERMANENT cuts: 1-8, 4-4, 5-4, 5-5, 5-7 removed in epics + status=backlog;
 > 1-7/2-5/2-6/3-6 simplified; AD-1/4/8/10/15 + Open Questions simplified;
-> cwd-mount + launch guard + 10-host baseline + SDK warn-not-fail in code;
-> `video-demo.sh` runbook added. This doc remains as history.
+> cwd-mount + launch guard + 10-host baseline + SDK warn-not-fail in code.
+> This doc remains as history.
 
 - date: 2026-10-13
 - trigger: POC too robust to demo; 3 days debugging substrate vs dockertest 1-day working baseline
@@ -49,7 +49,7 @@ Everything else is post-video.
 - [x] 1.2 Core problem — **PRD MVP Review** (checklist 4.3 family). PRD already says "MVP for showcase, not production-hardened"; epics/spine added hardening beyond it. Category: scope exceeds demo need, not technical impossibility.
 - [x] 1.3 Evidence — sprint-status + deferred-work + live containerd/QEMU logs + dockertest working baseline (see §1).
 - [x] 2.1 Current epics completable as planned? No — Epic 5 live gates cannot complete on F38; 1-7/2-5 carry unproven Bun + SDK pre-seed work.
-- [x] 2.2–2.5 Epic changes — defer, don't delete. No epic removed; in-progress stories simplified or deferred to `post-video`. Order unchanged; Epic 5 split into video-demo subset vs deferred decisions.
+- [x] 2.2–2.5 Epic changes — defer, don't delete. No epic removed; in-progress stories simplified or deferred to `post-video`. Order unchanged; Epic 5 split into concept-demo subset vs deferred decisions.
 - [x] 3.1 PRD conflicts? No core-goal conflict. PRD already out-of-scopes hardening/testing/CI/perf/docs. Only needs a "video scope" note.
 - [x] 3.2 Architecture conflicts — AD-4 (concatenated bundle), AD-8 (vendored catalog + SDK pre-seed), AD-10 gate (d), AD-11 (strict single-source), AD-13 (audit lines). Each needs a `POST-VIDEO` marker, not a rewrite.
 - [x] 3.3 UX — [N/A]. No UX doc; CLI surface unchanged (`opencode`, `down`, `status`, `whitelist add|list`, `keys set|list`, `ca export`).
@@ -181,7 +181,6 @@ Rationale: Video needs a readable failure, not an SELinux compiler.
   4. Narrow `spec-fix-kata-qemu-pid-denied.md` to early-fail guard; move policy-module tasks to deferred-work.md.
   5. Update `sprint-status.yaml`: set 1-8/4-4/5-4/5-5/5-7 `backlog` with `post-video` tag; keep 1-7/2-5/2-6/3-6/5-1/5-2/5-3/5-6 `in-progress` under relaxed ACs.
   6. Code relaxations (small, reversible): allow `models.opencode.ai` in seed allowlist; downgrade SDK pre-seed fail to warn; simplify proxy healthcheck to file-exists; permit CA-env pattern — each behind a `# VIDEO-RELAXATION 2026-10-13` comment naming its AD restore.
-  7. Demo script (new, ~30 lines): proxy log tail → injection fp → blocked curl → guest uname — the video runbook.
 - Success criteria: `secureai opencode` reaches TUI on the booting host; model call injects (fp logged); non-allowlisted curl 403s; guest kernel ≠ host; exit tears down with no orphans. Nothing else gates the video.
 - Post-video restore: remove each `# VIDEO-RELAXATION` marker to re-harden; deferred stories resume from `backlog`.
 
