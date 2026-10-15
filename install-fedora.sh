@@ -789,7 +789,20 @@ install_layout() {
   if ! fetch_one secureai "$SECUREAI_BIN"; then
     die "Cannot obtain the secureai CLI from ${SECUREAI_REPO_BASE:-the local tree}."
   fi
+  # A cleanly cut connection can hand curl a truncated file with exit 0
+  # (observed: exactly 32768 bytes, dying at line 741). Never install that.
+  bash -n "$SECUREAI_BIN" \
+    || die "The downloaded secureai CLI fails 'bash -n' -- refusing to install a truncated copy.
+  Re-run the installer; if it recurs, fetch by hand and compare sizes:
+    curl -fsSL ${SECUREAI_REPO_BASE}/secureai | wc -c"
   chmod 0755 "$SECUREAI_BIN"
+  # A stale copy at /usr/local/sbin/secureai shadows this one under sudo's
+  # secure_path (sbin before bin) and has executed truncated code. AD-16
+  # names this path the single entry point, so remove the shadow.
+  if [[ -e /usr/local/sbin/secureai ]]; then
+    rm -f /usr/local/sbin/secureai \
+      && warn "removed stale shadow /usr/local/sbin/secureai (secure_path prefers sbin over bin)."
+  fi
 
   # 0700 on both: these hold key material and must not be traversable by the
   # unprivileged proxy container. The proxy's read access to its runtime copy is
