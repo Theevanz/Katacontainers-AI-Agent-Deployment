@@ -52,13 +52,6 @@ curl -fsSL https://raw.githubusercontent.com/Theevanz/Katacontainers-AI-Agent-De
 
 Installs machine-wide and root-owned. No `git clone` needed — piped install
 fetches the payload from this repo (`SECUREAI_REPO_BASE` defaults to `main`).
-Clone alternative:
-
-```bash
-git clone https://github.com/Theevanz/Katacontainers-AI-Agent-Deployment.git
-cd Katacontainers-AI-Agent-Deployment
-sudo bash install-fedora.sh
-```
 
 No per-user variant — the checkout is never referenced at runtime. Re-running is
 idempotent.
