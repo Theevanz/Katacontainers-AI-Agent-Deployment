@@ -15,3 +15,4 @@
 # `secureai keys list` always masks values, and no command reveals a raw key.
 
 "api.anthropic.com": ""
+"api.meta.ai": ""

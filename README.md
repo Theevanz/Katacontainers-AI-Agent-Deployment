@@ -117,6 +117,7 @@ default-allow, so narrowing this list is an edit to a config file, not to code.
 
 ```
 api.anthropic.com
+api.meta.ai
 github.com
 *.githubusercontent.com
 registry.npmjs.org

@@ -125,6 +125,10 @@ services:
       # out and never travels back into the guest (AD-1, AD-10).
       ANTHROPIC_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
       OPENAI_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+      META_MODEL_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+      MODEL_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+      META_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
+      MUSE_API_KEY: ${SECUREAI_PLACEHOLDER_KEY}
       # No OPENCODE_API_KEY here on purpose: Zen free models are used
       # anonymously, and any placeholder Bearer would turn anonymous calls
       # into `Invalid credential` rejections upstream.

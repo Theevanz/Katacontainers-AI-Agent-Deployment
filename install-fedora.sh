@@ -1280,6 +1280,7 @@ main() {
 
     2. Store a key. The value is masked by every read-back:
          sudo secureai keys set api.anthropic.com sk-ant-...
+         sudo secureai keys set api.meta.ai <MODEL_API_KEY>
 
     3. Start a session (no sudo -- docker group membership is enough):
          secureai opencode

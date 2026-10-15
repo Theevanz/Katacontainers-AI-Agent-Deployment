@@ -14,6 +14,7 @@
 # closed on every request.
 
 - "api.anthropic.com"
+- "api.meta.ai"
 - "github.com"
 - "*.githubusercontent.com"
 - "registry.npmjs.org"

@@ -20,12 +20,13 @@ readonly SECUREAI_COMPOSE_FILE="${SECUREAI_APP_DIR}/docker-compose.yml"
 SECUREAI_WORKSPACE="${SECUREAI_VAR}/workspace"  # NOT readonly: compose.env is allowed to re-pin it
 readonly SECUREAI_CA="${SECUREAI_VAR}/ca.pem"
 
-# The ten-host reviewed baseline of AD-15. Seeded on first run so a fresh install works
+# The eleven-host reviewed baseline of AD-15. Seeded on first run so a fresh install works
 # out of the box. This list is duplicated in config/whitelist.yaml and README.md
 # on purpose: it is the documented default allowlist, and documentation that
 # disagrees with behaviour is worse than no documentation (Story 3.4).
 readonly -a SECUREAI_BASELINE_ALLOWLIST=(
   "api.anthropic.com"
+  "api.meta.ai"
   "github.com"
   "*.githubusercontent.com"
   "registry.npmjs.org"
@@ -257,7 +258,7 @@ cmd_init_config() {
     } >"${SECUREAI_ETC}/whitelist.yaml"
     chmod 0640 "${SECUREAI_ETC}/whitelist.yaml"
     chown root:root "${SECUREAI_ETC}/whitelist.yaml"
-    ok "seeded the 10-host allowlist baseline"
+    ok "seeded the 11-host allowlist baseline"
   fi
 
   [[ -f "${SECUREAI_ETC}/settings.yaml" ]] || {

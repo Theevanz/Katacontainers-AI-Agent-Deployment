@@ -10,6 +10,11 @@
       "options": {
         "baseURL": "https://api.anthropic.com"
       }
+    },
+    "meta": {
+      "options": {
+        "baseURL": "https://api.meta.ai/v1"
+      }
     }
   }
 }

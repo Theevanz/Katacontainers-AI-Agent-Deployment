@@ -1197,7 +1197,7 @@ class TestCliKeyHandling(unittest.TestCase):
         # Entries are quoted: a bare `- *.example.com` is a YAML scanner error.
         self.assertIn("""- "%s\"""", body)
 
-    def test_whitelist_baseline_matches_the_documented_ten_hosts(self):
+    def test_whitelist_baseline_matches_the_documented_eleven_hosts(self):
         source = read(CLI)
         block = source[source.index("SECUREAI_BASELINE_ALLOWLIST=("):]
         block = block[block.index("("):block.index(")")]
@@ -1206,7 +1206,7 @@ class TestCliKeyHandling(unittest.TestCase):
         import yaml
         file_hosts = yaml.safe_load(seeded)
         self.assertEqual(hosts, file_hosts, "CLI seed and shipped baseline must agree")
-        self.assertEqual(len(hosts), 10)
+        self.assertEqual(len(hosts), 11)
         readme = read(os.path.join(REPO_ROOT, "README.md"))
         for host in hosts:
             self.assertIn(host, readme, "%s must appear in the documented allowlist" % host)
