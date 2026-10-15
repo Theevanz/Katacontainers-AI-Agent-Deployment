@@ -872,14 +872,32 @@ label_paths() {
 
   local path
   for path in "$SECUREAI_ETC" "$SECUREAI_VAR" "$SECUREAI_APP_DIR"; do
+    # Assert first: a path already carrying container_file_t needs no store
+    # write, so a broken semanage store must not fail a correctly labelled
+    # host (observed: store unreadable while two of three paths still good).
+    local current
+    current="$(ls -Zd "$path" 2>/dev/null | awk '{print $1}' | cut -d: -f3 || true)"
+    if [[ "$current" == "container_file_t" ]]; then
+      ok "${path} is container_file_t"
+      continue
+    fi
     # `-a` fails when the definition already exists, and `-m` fails when it does
     # not. Trying `-a` then `-m` is idempotent WITHOUT the delete-first dance,
     # which briefly leaves the path with no fcontext at all if the re-add fails.
-    semanage fcontext -a -t container_file_t "${path}(/.*)?" 2>/dev/null \
-      || semanage fcontext -m -t container_file_t "${path}(/.*)?" \
-      || die "Could not set the SELinux fcontext for ${path}.
-     The path currently has no usable label; later bind mounts would be refused."
-    restorecon -RF "${path}" || warn "restorecon failed for ${path}."
+    if semanage fcontext -a -t container_file_t "${path}(/.*)?" 2>/dev/null \
+      || semanage fcontext -m -t container_file_t "${path}(/.*)?" 2>/dev/null; then
+      restorecon -RF "${path}" || warn "restorecon failed for ${path}."
+    else
+      # The policy store itself is unreachable (observed: "policy is not
+      # managed or store cannot be accessed" while Enforcing). Fall back to
+      # an immediate label so the session can run now; warn that it will not
+      # survive a full filesystem relabel until the store is repaired.
+      warn "semanage could not write the fcontext for ${path}; trying chcon instead."
+      chcon -R -t container_file_t "${path}" 2>/dev/null \
+        || die "Could not set the SELinux fcontext for ${path}.
+     The policy store is unreachable and chcon also failed; later bind mounts would be refused.
+     Repair with: semanage fcontext -l; ls -la /etc/selinux/targeted/"
+    fi
   done
 
   # AD-7: assert the resulting label. A zero exit from semanage does not mean
