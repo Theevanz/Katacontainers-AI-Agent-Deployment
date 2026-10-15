@@ -6,7 +6,7 @@ spec's I/O & edge-case matrix.
 
 What is genuinely executable here vs. what is only structural
 -----------------------------------------------------------------
-The installer refuses a non-Fedora-43/44 host BEFORE touching anything, so
+The installer refuses a non-Fedora-44 host BEFORE touching anything, so
 its first gate is exercised for real on any machine (matrix rows 1 and 2).
 Rows that need root, a Kata runtime, or a real image build cannot execute on
 a developer box without them; those are asserted structurally over the source

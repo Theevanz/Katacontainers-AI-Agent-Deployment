@@ -1,8 +1,8 @@
 # SecureAI — Kata-Containerized OpenCode
 
-> **Proof of concept. Fedora only.**
-> This repository demonstrates the concept on Fedora. It is not production-hardened
-> and is not supported on any other platform. Do not rely on it for production use.
+> **Proof of concept for Fedora 44 only.**
+> This repository demonstrates the concept on Fedora 44. It is not production-hardened
+> and is not supported on Fedora 38, F43, or any other platform. Do not rely on it for production use.
 
 > **Status: designed and implemented as a build substrate.** The prose in this
 > file is the product contract; the code lives in the repo root under
@@ -40,18 +40,27 @@ the blocking open question in the architecture spine; until it is answered, trea
 
 ## Requirements
 
-- Fedora 38, 43, or 44 (asserted by the installer, which refuses anything else)
+- Fedora 44 (asserted by the installer, which refuses anything else)
 - `sudo` access
 - A host with nested virtualization enabled
 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<org>/secureai/main/install-fedora.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Theevanz/Katacontainers-AI-Agent-Deployment/main/install-fedora.sh | sudo bash
 ```
 
-Installs machine-wide and root-owned. There is no `git clone` prerequisite and no
-per-user variant — the checkout is never referenced at runtime. Re-running is
+Installs machine-wide and root-owned. No `git clone` needed — piped install
+fetches the payload from this repo (`SECUREAI_REPO_BASE` defaults to `main`).
+Clone alternative:
+
+```bash
+git clone https://github.com/Theevanz/Katacontainers-AI-Agent-Deployment.git
+cd Katacontainers-AI-Agent-Deployment
+sudo bash install-fedora.sh
+```
+
+No per-user variant — the checkout is never referenced at runtime. Re-running is
 idempotent.
 
 After install, the image build needs the CA first. Privileged setup needs
@@ -183,7 +192,7 @@ Not addressed in this proof of concept:
   acknowledged tension with this and is untested)
 - no network-level egress backstop
 - HTTP/2 support unverified
-- Fedora 38/43/44 only
+- Fedora 44 only
 
 Certificate pinning is *not* on this list: it was checked and opencode performs no TLS
 pinning, which is what makes MITM substitution viable here.

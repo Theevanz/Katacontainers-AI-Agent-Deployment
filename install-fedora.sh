@@ -22,17 +22,16 @@
 
 set -euo pipefail
 
-# Versions the installer will run on. Default is everything this build has been
-# reasoned through for; tighten or widen via this environment variable
-# (SECUREAI_FEDORA_VERSIONS="38" install-fedora.sh ships F38 support without
-# committing to F43/F44 assumption-only acceptance). This is the one knob a
-# tester uses to prove the guard works without editing source text:
+# Versions the installer will run on. Proof of concept for Fedora 44 only;
+# tighten or widen via this environment variable for testing only.
+# This is the one knob a tester uses to prove the guard works without
+# editing source text:
 #
 #   SECUREAI_FEDORA_VERSIONS="99" bash install-fedora.sh
 #
 # A wider list that INCLUDES the host's version makes the installer proceed;
 # anything narrower refuses with a readable message.
-readonly SECUREAI_FEDORA_VERSIONS="${SECUREAI_FEDORA_VERSIONS:-38 43 44}"
+readonly SECUREAI_FEDORA_VERSIONS="${SECUREAI_FEDORA_VERSIONS:-44}"
 readonly SECUREAI_APP_DIR="/opt/secureai"
 readonly SECUREAI_BIN="/usr/local/bin/secureai"
 readonly SECUREAI_ETC="/etc/secureai"
@@ -70,9 +69,9 @@ readonly -a SECUREAI_KATA_STATIC_MEMBERS=(
 )
 
 # Payload: directory of an already-materialised tree, or a base URL to fetch
-# each file from. Empty means "look next to this script", then give up.
+# each file from. Defaults to this repo so `curl | sudo bash` works piped.
 SECUREAI_PAYLOAD_DIR="${SECUREAI_PAYLOAD_DIR:-}"
-SECUREAI_REPO_BASE="${SECUREAI_REPO_BASE:-}"
+SECUREAI_REPO_BASE="${SECUREAI_REPO_BASE:-https://raw.githubusercontent.com/Theevanz/Katacontainers-AI-Agent-Deployment/main}"
 
 # Optional pins for the Kata wiring. The static flavour fills both;
 # SECUREAI_KATA_FLAVOR=rpm re-discovers them from the package database.
@@ -109,8 +108,9 @@ die()  { printf '\033[1;31m error\033[0m %s\n' "$*" >&2; exit 1; }
 check_preconditions() {
   log "Checking that this host can run SecureAI"
 
-  # 1. Fedora 38/43/44 only -- 41 and 42 are EOL. If the host is not a
-  #    supported Fedora at all, say so and stop before touching anything.
+  # 1. Fedora 44 only (PoC). F38 is host-blocked (tcfilter impossibility,
+  # kata 3.0.2 Go); F43 not validated. If the host is not Fedora 44,
+  #    say so and stop before touching anything.
   if [[ ! -r /etc/os-release ]]; then
     die "SecureAI needs one of: ${SECUREAI_FEDORA_VERSIONS}, but /etc/os-release could not be read,
      so the distribution could not be identified. Unsupported platform. Set
@@ -181,7 +181,7 @@ install_packages() {
   # package name resolves to Fedora's moby-engine, which CONFLICTS with an
   # installed docker-ce-cli; asking for it unconditionally breaks every
   # Docker-CE host even though its engine is fine. No per-release package
-  # names appear here, so the same logic runs on F38, F43, F44, and later.
+  # names appear here, so the same logic runs on F44 and later.
   local missing=()
   # Docker engine: presence means the `docker` binary answers, whichever
   # flavour (moby or CE) provides it. A present-but-stopped daemon is started
@@ -228,9 +228,9 @@ install_packages() {
   fi
 
   # Compose v2 is the ONLY hard input to the session lifecycle, so its
-  # package name is resolved rather than assumed: F38's own repos ship it as
-  # docker-compose-plugin (also the docker-ce-stable package), and some F43/F44
-  # images ship it only from the Docker CE repo under the same name. If neither
+  # package name is resolved rather than assumed: Fedora's own repos ship it as
+  # docker-compose-plugin (also the docker-ce-stable package), and some images
+  # ship it only from the Docker CE repo under the same name. If neither
   # works, the message points at the right-hand place to get it, instead of
   # 'No match for argument' from dnf.
   if dnf -y install docker-compose-plugin 2>/dev/null || dnf -y install docker-compose 2>/dev/null; then
@@ -529,7 +529,7 @@ write_daemon_json() {
   local raw_version version_key time_ns_flag
   raw_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "")"
   # A static install (or an explicit SECUREAI_KATA_CONFIG_PATH) names the
-  # config outright. Otherwise ask the package database first: on F38/F43/F44
+  # config outright. Otherwise ask the package database first: on Fedora
   # the toml lands at a different path depending on which kata-containers
   # package variant shipped it (qemu Go runtime vs runtime-rs vs rust-shim
   # defaults), and a stale hard-coded path is exactly the kind of assumption
@@ -764,7 +764,7 @@ fetch_payload() {
     fetch_one "$rel" "$dest" || die \
 "Cannot obtain ${rel}: this installer was piped in without its application tree.
  Re-run with the tree supplied, e.g.
-   SECUREAI_REPO_BASE=https://raw.githubusercontent.com/<org>/secureai/main \\
+   SECUREAI_REPO_BASE=https://raw.githubusercontent.com/Theevanz/Katacontainers-AI-Agent-Deployment/main \\
      bash install-fedora.sh"
   done
   ok "application tree installed to ${SECUREAI_APP_DIR}"
