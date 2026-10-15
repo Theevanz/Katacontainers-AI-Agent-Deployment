@@ -1089,20 +1089,34 @@ TEEOF
       checkmodule -M -m -o "${tmpdir}/${module}.mod" "${tmpdir}/${module}.te" \
         && semodule_package -o "${tmpdir}/${module}.pp" -m "${tmpdir}/${module}.mod" \
         && semodule -i "${tmpdir}/${module}.pp" 2>"${tmpdir}/semodule.err" \
-        || die "The ${module} policy module was refused by semodule:
+        || {
+        # A reinstall with an unreachable policy store can refuse a rebuild
+        # while the previously installed module is still loaded; keep it.
+        if semodule -l 2>/dev/null | grep -Eq "^${module}([[:space:]]|$)"; then
+          warn "semodule refused the rebuilt ${module}; keeping the already-loaded module."
+        else
+          die "The ${module} policy module was refused by semodule:
      $(tail -3 "${tmpdir}/semodule.err" 2>/dev/null || true)
   This host denies something outside the vhost/mounton baseline. Reproduce
   the session failure, then build the module from live denials:
     ausearch -m avc -ts recent | audit2allow -M ${module}
     sudo semodule -i ${module}.pp"
+        fi
+      }
       warn "io_uring is not covered by the installed module on this host. If a
        session later wedges in Created with an io_uring denial, regenerate:
          ausearch -m avc -ts recent | audit2allow -M ${module}
          sudo semodule -i ${module}.pp"
     else
-      die "The ${module} policy module was refused by semodule:
+      # Same keep-loaded fallback as above for a reinstall whose rebuild is
+      # refused while the previous module is still in place.
+      if semodule -l 2>/dev/null | grep -Eq "^${module}([[:space:]]|$)"; then
+        warn "semodule refused the rebuilt ${module}; keeping the already-loaded module."
+      else
+        die "The ${module} policy module was refused by semodule:
      $(tail -3 "${tmpdir}/semodule.err" 2>/dev/null || true)
   Inspect live denials with:  ausearch -m avc -ts recent"
+      fi
     fi
   fi
   rm -f "${tmpdir}/semodule.err"
@@ -1195,12 +1209,19 @@ ensure_kata_permissive_domains() {
   for dom in container_runtime_t container_t; do
     if semanage permissive -l 2>/dev/null | grep -qx "$dom"; then
       ok "${dom} already permissive"
-    else
-      semanage permissive -a "$dom" \
-        || die "Could not set ${dom} permissive. The Kata VMM is denied its
-       pid/socket writes under Enforcing without this (or a scoped audit2allow
-       module, which needs a working audit trail this host may not have)."
+    elif semanage permissive -a "$dom" 2>/dev/null; then
       ok "${dom} set permissive"
+    else
+      # Unreachable policy store (observed alongside the semanage/semanage
+      # failures above): cannot confirm or set. The previously set domains
+      # persist in the loaded policy, so warn loudly rather than fail the
+      # whole install; a wedged-in-Created guest means this did not hold.
+      warn "Could not set ${dom} permissive (policy store unreachable).
+     If a session later wedges in Created, repair the store first:
+       semanage permissive -l
+     then re-run the installer. The Kata VMM is denied its pid/socket writes
+     under Enforcing without this (or a scoped audit2allow module, which needs
+     a working audit trail this host may not have)."
     fi
   done
 }
