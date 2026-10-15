@@ -983,12 +983,17 @@ ensure_kata_vmm_policy() {
   # /run and /var/run are an equivalency pair; semanage requires the /run
   # form here (the /var/run form is refused as conflicting with the
   # equivalency rule). Both names address the same tmpfs files.
-  semanage fcontext -a -t container_var_run_t "/run/vc(/.*)?" 2>/dev/null \
-    || semanage fcontext -m -t container_var_run_t "/run/vc(/.*)?" \
-    || die "Could not set the SELinux fcontext for /run/vc.
-     The path currently has no usable label; QEMU would be refused its PID file."
-  restorecon -RF /run/vc/vm 2>/dev/null \
-    || warn "restorecon failed for /run/vc/vm."
+  # If the policy store itself is unreachable, fall back to chcon so a
+  # labelled host is not failed by the store; the label is asserted below.
+  if semanage fcontext -a -t container_var_run_t "/run/vc(/.*)?" 2>/dev/null \
+    || semanage fcontext -m -t container_var_run_t "/run/vc(/.*)?" 2>/dev/null; then
+    restorecon -RF /run/vc/vm 2>/dev/null \
+      || warn "restorecon failed for /run/vc/vm."
+  else
+    warn "semanage could not write the fcontext for /run/vc; trying chcon instead."
+    chcon -R -t container_var_run_t /run/vc/vm 2>/dev/null \
+      || warn "chcon failed for /run/vc/vm; the label is asserted below."
+  fi
 
   local module="secureai-kata"
   local tmpdir
