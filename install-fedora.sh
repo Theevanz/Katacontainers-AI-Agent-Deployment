@@ -798,10 +798,29 @@ install_layout() {
   chmod 0755 "$SECUREAI_BIN"
   # A stale copy at /usr/local/sbin/secureai shadows this one under sudo's
   # secure_path (sbin before bin) and has executed truncated code. AD-16
-  # names this path the single entry point, so remove the shadow.
+  # names this path the single entry point, so remove the shadow -- unless
+  # it IS this file. Where /usr/local/sbin aliases /usr/local/bin (symlink
+  # or bind mount) both paths name one dentry, so an unguarded rm deletes
+  # the CLI installed just above and verify_install fails with "not
+  # executable". The -ef test compares device+inode: a genuine separate
+  # stale copy is still removed, an aliased one is left in place (it
+  # executes the same bytes, so there is no shadow hazard).
   if [[ -e /usr/local/sbin/secureai ]]; then
-    rm -f /usr/local/sbin/secureai \
-      && warn "removed stale shadow /usr/local/sbin/secureai (secure_path prefers sbin over bin)."
+    if [[ /usr/local/sbin/secureai -ef "$SECUREAI_BIN" ]]; then
+      warn "/usr/local/sbin/secureai is the same file as ${SECUREAI_BIN} (aliased directories); leaving it in place."
+    else
+      rm -f /usr/local/sbin/secureai \
+        && warn "removed stale shadow /usr/local/sbin/secureai (secure_path prefers sbin over bin)."
+    fi
+  fi
+  # Fail fast with facts: the closing ok line below is unconditional, so
+  # without this a missing/unexecutable CLI would only surface later in
+  # verify_install, far from the step that broke it.
+  if [[ ! -x "$SECUREAI_BIN" ]]; then
+    die "The secureai CLI is not executable right after install (${SECUREAI_BIN}). Observed:
+    $(ls -l "$SECUREAI_BIN" /usr/local/sbin/secureai 2>&1 || true)
+  Confirm whether /usr/local/sbin aliases /usr/local/bin with:
+    ls -ld /usr/local/sbin /usr/local/bin"
   fi
 
   # 0700 on both: these hold key material and must not be traversable by the
@@ -1242,7 +1261,13 @@ ensure_kata_permissive_domains() {
 # =========================================================================
 verify_install() {
   log "Verifying the installation"
-  [[ -x "$SECUREAI_BIN" ]] || die "${SECUREAI_BIN} is not executable."
+  if [[ ! -x "$SECUREAI_BIN" ]]; then
+    die "${SECUREAI_BIN} is not executable. Observed:
+    $(ls -l "$SECUREAI_BIN" /usr/local/sbin/secureai 2>&1 || true)
+  If /usr/local/sbin aliases /usr/local/bin (ls -ld shows a symlink), an
+  older installer removed this file as a 'stale shadow'. Re-run the current
+  install-fedora.sh, which leaves an aliased copy in place."
+  fi
   [[ -d "$SECUREAI_APP_DIR" ]] || die "${SECUREAI_APP_DIR} is missing."
   [[ -d "$SECUREAI_ETC" ]] || die "${SECUREAI_ETC} is missing."
   # PATH is checked with a warning, not a die: the file is installed correctly

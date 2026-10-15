@@ -2344,5 +2344,114 @@ class TestVmmPolicyRebuildNote(unittest.TestCase):
         self.assertNotIn("setenforce 0", read(INSTALLER))
 
 
+class TestSbinShadowGuard(unittest.TestCase):
+    """The /usr/local/sbin shadow removal must not delete the CLI itself.
+
+    Regression: the shadow removal introduced for sudo secure_path shadowing
+    ran `rm -f /usr/local/sbin/secureai` unconditionally after installing
+    /usr/local/bin/secureai. Where sbin aliases bin (symlink or bind mount)
+    both paths name one dentry, so the rm deleted the just-installed CLI and
+    verify_install died with "not executable" -- every re-install on such a
+    host failed. These tests EXECUTE the real block from install_layout with
+    the hardcoded sbin path rewritten onto fixtures, so the guard is tested,
+    not described.
+    """
+
+    def _block(self, start_marker, end_marker="\n  fi"):
+        body = function_body(INSTALLER, "install_layout")
+        start = body.index(start_marker)
+        end = body.index(end_marker, start)
+        return body[start:end + len(end_marker)]
+
+    def _run_block(self, block, bin_path, sbin_path, extra_env=""):
+        script = "\n".join([
+            "set -euo pipefail",
+            'warn() { printf "warn: %s\\n" "$*" >&2; }',
+            'die() { printf "error: %s\\n" "$*" >&2; exit 1; }',
+            'SECUREAI_BIN="%s"' % bin_path,
+            extra_env,
+            block.replace("/usr/local/sbin/secureai", sbin_path),
+        ])
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=30,
+        )
+
+    def _shadow_block(self):
+        return self._block("if [[ -e /usr/local/sbin/secureai ]]; then")
+
+    def test_guard_exists_in_install_layout(self):
+        body = function_body(INSTALLER, "install_layout")
+        self.assertIn('-ef "$SECUREAI_BIN"', body,
+                      "the shadow rm must be guarded by a same-file test")
+        self.assertLess(body.index('-ef "$SECUREAI_BIN"'),
+                        body.index("rm -f /usr/local/sbin/secureai"))
+
+    def test_aliased_sbin_leaves_the_cli_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.mkdir(bin_dir)
+            os.symlink("bin", os.path.join(tmp, "sbin"))
+            cli = os.path.join(bin_dir, "secureai")
+            with open(cli, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/bash\necho new\n")
+            os.chmod(cli, 0o755)
+            result = self._run_block(
+                self._shadow_block(), cli, os.path.join(tmp, "sbin", "secureai"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("same file", result.stderr)
+            self.assertTrue(os.path.isfile(cli),
+                            "aliased rm must not delete the installed CLI")
+            self.assertEqual(os.stat(cli).st_mode & 0o777, 0o755)
+
+    def test_separate_stale_shadow_is_still_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            sbin_dir = os.path.join(tmp, "sbin")
+            os.mkdir(bin_dir)
+            os.mkdir(sbin_dir)
+            cli = os.path.join(bin_dir, "secureai")
+            with open(cli, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/bash\necho new\n")
+            os.chmod(cli, 0o755)
+            stale = os.path.join(sbin_dir, "secureai")
+            with open(stale, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/bash\necho stale\n")
+            result = self._run_block(self._shadow_block(), cli, stale)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("removed stale shadow", result.stderr)
+            self.assertFalse(os.path.exists(stale))
+            with open(cli, encoding="utf-8") as fh:
+                self.assertIn("echo new", fh.read())
+
+    def test_missing_shadow_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.mkdir(bin_dir)
+            cli = os.path.join(bin_dir, "secureai")
+            with open(cli, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/bash\necho new\n")
+            os.chmod(cli, 0o755)
+            result = self._run_block(
+                self._shadow_block(), cli,
+                os.path.join(tmp, "sbin", "secureai"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(os.path.isfile(cli))
+
+    def test_fail_fast_assert_fires_with_observations(self):
+        block = self._block('if [[ ! -x "$SECUREAI_BIN" ]]; then')
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "secureai")
+            result = self._run_block(block, missing,
+                                     os.path.join(tmp, "sbin", "secureai"))
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("not executable right after install", result.stderr)
+            self.assertIn("ls -ld", result.stderr)
+
+    def test_verify_reports_observations_not_just_a_bare_error(self):
+        body = function_body(INSTALLER, "verify_install")
+        self.assertIn("ls -l", body,
+                      "verify_install must print what it saw on failure")
+
+
 if __name__ == "__main__":
     unittest.main()
